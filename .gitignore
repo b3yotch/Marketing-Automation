@@ -24,9 +24,9 @@ Thumbs.db
 
 # Ignore test files if desired
 test.py
-scripts/
 
 test_groq.py
 model_comparison_output.md
 outputs/
 cogvideox-2b-img2vid-workflow-API.json
+test_urls.csv
