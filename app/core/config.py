@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     prompt_gen_max_tokens: int = 2048
     prompt_gen_temperature: float = 0.6
 
+    tavily_api_key: str = ""
+
     # Scraper
     scrape_timeout_ms: int = 30000
     nav_attempt_timeout_ms: int = 10000

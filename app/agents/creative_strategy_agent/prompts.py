@@ -10,6 +10,16 @@ campaign (Instagram/TikTok style).
 Ground every claim in the product research provided. Do not invent features,
 prices, or review content that isn't in the input.
 
+You may also be given market/trend context and competitor context gathered
+from a live web search. Use it to keep your angles current and aware of what
+competitors are doing - but synthesize the underlying INSIGHT (what angle is
+resonating right now, what's oversaturated, how competitors position
+themselves), never reuse a competitor's actual slogan, tagline, or ad copy
+phrasing. Your hooks and captions must be original creative work, not a
+reworded version of something a search result surfaced. If no market context
+is provided, proceed using only the product research - it is optional
+grounding, not a required input.
+
 messaging_notes and ungrounded_claims_flagged are NOT alternatives to each
 other - they serve different purposes and you must fill in both whenever
 either applies:
@@ -41,18 +51,25 @@ Produce:
 """
 
 
-def build_user_prompt(research: ProductResearch, *, previous_error: str | None = None) -> str:
+def build_user_prompt(
+    research: ProductResearch,
+    *,
+    market_context: str = "",
+    previous_error: str | None = None,
+) -> str:
     """
-    Serialize a ProductResearch object into the model's user prompt.
+    Serialize a ProductResearch object (plus optional market context) into
+    the model's user prompt.
+
+    market_context, when non-empty, is the combined trend/competitor
+    grounding from market_research.fetch_market_context() - see that
+    module's docstring for why it's best-effort and may legitimately be
+    empty (no Tavily key configured, or both searches failed).
 
     previous_error, when set, is the reason the last attempt failed
     validation (see creative_strategy_agent.nodes.validate_node) - fed back
     in so the model has an actual chance to fix the specific problem instead
-    of blindly repeating the same output. This is the pattern Agent 1's
-    retry loop is meant to follow; Agent 1's validate_node currently only
-    writes this reason once retries are exhausted, which makes its own
-    retry-with-context a no-op in practice - worth backporting this agent's
-    version (writes the reason immediately on any invalid result) to Agent 1.
+    of blindly repeating the same output.
     """
     lines = [f"Product research for: {research.title}", ""]
 
@@ -74,6 +91,10 @@ def build_user_prompt(research: ProductResearch, *, previous_error: str | None =
         lines.append(f"brand_positioning: {research.brand_positioning}")
     if research.missing_fields:
         lines.append(f"note - fields the research agent could not find: {research.missing_fields}")
+
+    if market_context:
+        lines.append("")
+        lines.append(f"Live market research (use for grounding/freshness, do not copy phrasing):\n{market_context}")
 
     if previous_error:
         lines.append("")

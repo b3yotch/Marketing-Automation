@@ -18,6 +18,12 @@ class CreativeStrategyState(TypedDict, total=False):
 
     research: ProductResearch
 
+    # Fetched once by generate_node on its first call and cached here, so a
+    # retry loop (bump_retry -> generate) doesn't re-run the Tavily searches
+    # on every attempt - market context doesn't change based on what the
+    # model got wrong last time, unlike previous_error.
+    market_context: str | None
+
     creative: CreativeDirection | None
     model_used: str | None  # which model (primary/fallback) actually produced the output - for observability
 
