@@ -28,8 +28,12 @@ Agent 5 judging Agent 4's candidate frames) was discussed during Agent 5's
 design and deliberately deferred until Agent 5 proved itself in a real
 run. It has - see "Known gaps to revisit" below.
 
-Plus a bulk CSV processing layer (not started) for running the whole
-pipeline across many product URLs at once.
+Plus a bulk processing layer (built) for running many product URLs at
+once - see "Bulk processing" below. It's two commands, not one: a batch
+runner that takes every URL through Agent 5 (Image Selection) and stops,
+and a separate video command that spends Agent 6's ~33 minutes/product
+only against whichever subset you pick after reviewing what Agent 5
+selected.
 
 Each agent is a self-contained LangGraph subgraph living in its own
 `app/agents/<name>/` folder (`schema.py`, `prompts.py`, `state.py`,
@@ -105,14 +109,17 @@ generate --> validate --+--> END (valid, or retries exhausted)
     +----- bump_retry <--+ (invalid, retries remain)
 ```
 
-1. **generate** (`nodes.py` + `llm.py`) - calls `structured_chat_groq`
-   against a primary model (**gpt-oss-120b**), falling back to a secondary
-   model (**gpt-oss-20b**) on any provider failure. Model choice came from
-   a 3-way comparison (Llama 4 Scout / Llama 3.3 70B / gpt-oss-120b)
-   against sample inputs before writing any agent code - see
-   `Creative_strategy.md` Challenge 1. This agent needs genuine
-   creative/marketing judgment, not extraction, which is why it uses a
-   different (cloud, larger) model than Agent 1.
+1. **generate** (`nodes.py` + `llm.py` + `market_research.py`) - fetches
+   market/trend and competitor context via two concurrent Tavily searches
+   (`asyncio.gather`, not sequential - keeps the added latency close to
+   the slower of the two calls rather than their sum: ~11s total in
+   practice), then calls `structured_chat_groq` against a primary model
+   (**gpt-oss-120b**), falling back to a secondary model (**gpt-oss-20b**)
+   on any provider failure. Model choice came from a 3-way comparison
+   (Llama 4 Scout / Llama 3.3 70B / gpt-oss-120b) against sample inputs
+   before writing any agent code - see `Creative_strategy.md` Challenge 1.
+   This agent needs genuine creative/marketing judgment, not extraction,
+   which is why it uses a different (cloud, larger) model than Agent 1.
 2. **validate** - same low-bar philosophy as Agent 1 (non-empty
    hooks/captions), but writes a *specific* failure reason the moment
    validation fails - not just once retries are exhausted - so the
@@ -120,6 +127,33 @@ generate --> validate --+--> END (valid, or retries exhausted)
    something useful in it. (Agent 1's `validate_node` still has the older,
    weaker version of this pattern - worth backporting.)
 3. **bump_retry** - same as Agent 1, `max_creative_retries` (default 2).
+
+**Market research grounding (`market_research.py`):** the model's training
+cutoff means it has no idea what ad creative is actually working right now
+or what competitors are currently saying, so `fetch_market_context()` runs
+a trend search (`topic="news"`, biases toward recent content) and a
+competitor search (`search_depth="advanced"`) against Tavily. Three
+decisions worth knowing before touching this:
+- **Best-effort, not blocking** - every exception is caught and an empty
+  string returned rather than propagated, so a slow or down search API
+  never fails the whole creative call over what's an enrichment step, not
+  a hard dependency. Agent 2 runs fine with no Tavily key configured at
+  all.
+- **Explicit anti-copying instruction** - search results surface actual
+  competitor ad copy verbatim; the prompt is explicit that the model
+  should synthesize the *insight*, never reuse a competitor's actual
+  slogan or phrasing.
+- **Fetched once per `graph.ainvoke()` call, cached in state, not
+  per-retry** - `market_context` doesn't change based on what the model
+  got wrong last attempt, unlike `previous_error`, so a failed-then-retried
+  attempt still only pays for one Tavily fetch. This caching does *not*
+  survive across separate process invocations, though - see Creative_
+  strategy.md Challenge 6's "known nuance" and the matching entry under
+  "Known gaps to revisit".
+
+See `Creative_strategy.md` Challenge 6 for the full narrative, including
+how this was confirmed to actually change the model's output (not just
+plumbing that runs and gets ignored) on a real product page.
 
 Two fields, `messaging_notes` and `ungrounded_claims_flagged`, are prompted
 as a required pair rather than interchangeable alternatives - see
@@ -395,6 +429,9 @@ OLLAMA_RESEARCH_MODEL=qwen3.5:4b
 # Agents 2 & 3 - Groq (cloud)
 GROQ_API_KEY=your-key-here
 
+# Agent 2 - Tavily (cloud, market/competitor research - optional, best-effort)
+TAVILY_API_KEY=your-key-here
+
 # Agents 4 & 6 - ComfyUI (local)
 COMFYUI_SERVER=http://127.0.0.1:8188
 ```
@@ -522,6 +559,73 @@ Video Generation dominates the total by a wide margin - this is why it's
 one of the two stages on LangGraph's native checkpointer rather than the
 flat JSON mechanism (see "Checkpointing" above).
 
+## Bulk processing
+
+Two commands, not one - because Video Generation alone is ~78% of a full
+run's wall clock (2529.68s of it, from the measured run above), and it's
+the one output you'd most want a human to approve before an overnight
+batch spends GPU-hours on it.
+
+```bash
+# Agents 1-5 for every URL in a CSV (one 'url' column, or a bare URL list),
+# or for a single URL passed directly. Always stops before Video
+# Generation. Writes a timestamped results manifest as it goes.
+python scripts/run_batch.py urls.csv
+python scripts/run_batch.py https://example-store.com/products/some-widget
+python scripts/run_batch.py urls.csv --out outputs/october_batch.csv
+python scripts/run_batch.py urls.csv --stop-after prompts
+python scripts/run_batch.py urls.csv --fresh
+```
+
+```bash
+# Agent 6 for a chosen subset - reuses whatever's already checkpointed
+# (a selection-complete URL costs ~33 min; a never-run URL runs the full
+# pipeline first, ~42 min). Asks for confirmation before starting, since a
+# mistake here costs hours, not seconds.
+python scripts/generate_videos.py https://example-store.com/products/some-widget
+python scripts/generate_videos.py --csv picked.csv
+python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv --rows 3,7,12-15
+python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv --yes
+```
+
+**Why the split, not a `--with-video` flag on one command:** a batch of 50
+is ~7.9 hours through Agent 5 alone; adding video unconditionally would
+make it ~35 hours, almost all of it GPU-serialized and therefore not
+meaningfully parallelizable across products on one GPU (see Image_
+generation.md and Video_generation.md's ComfyUI-concurrency challenges for
+why running two products' GPU stages side by side is actively harmful, not
+just unhelpful). Stopping at Agent 5 turns the batch into a same-day
+reviewable artifact - selected images plus a flag for any theme Agent 5
+selected below its confidence threshold - and `generate_videos.py` spends
+the expensive stage only where that review says it's worth it.
+
+**Failure isolation is per-row, with no separate retry mechanism**, on
+purpose: `run_product()` (`app/core/pipeline.py`) never raises past a
+stage boundary and never exits, so one bad URL costs that row and nothing
+else. Re-running the same command re-processes the whole file, but every
+row that already finished is a checkpoint hit - this is the existing
+per-product checkpointing (see "Checkpointing" above) doing double duty as
+the batch-retry mechanism, not a second one layered on top.
+
+**The results manifest** (`app/core/manifest.py`, `outputs/
+{batch,video}_results_<UTC timestamp>.csv`) is written and flushed after
+each product, not buffered to the end - an interrupted 8-hour batch still
+leaves a readable record of everything that finished. Columns: `url`,
+`status`, `stage_reached`, `error`, `themes_completed`, `total_images`,
+`selection_flags` (which themes came back `selected_below_threshold` -
+the signal worth sorting by before deciding what to animate),
+`videos_generated` (blank on a batch-only run), `elapsed_seconds`,
+`finished_at`.
+
+**Sequential, deliberately, with no concurrency across products.** Through
+Agent 5, roughly 97% of a product's time is GPU/local-model-bound (Agents
+1 and 5 share the same Ollama model as Agent 4's ComfyUI instance shares
+the GPU); the LLM-bound stages (Agents 2, 3, and now Agent 2's Tavily
+calls) are a few percent of the total, so overlapping them across products
+buys single-digit-percent speedup for real implementation complexity.
+Sequential isn't the "simple but slow" option here - it's within a few
+percent of the achievable optimum on one machine with one GPU.
+
 ## Configuration notes
 
 Settings live in `app/core/config.py`, env-driven, shared across agents.
@@ -560,6 +664,8 @@ Worth understanding rather than just accepting the defaults:
 | `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) |
 | `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5) |
 | `app/core/langgraph_checkpoint.py` | LangGraph-native resume helper (`run_checkpointed`), used by Agents 4 and 6 |
+| `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; never raises past a stage boundary, returns a `ProductRunResult` instead |
+| `app/core/manifest.py` | `ManifestWriter` (per-row-flushed results CSV) + `read_urls()` (accepts a bare URL or a CSV) |
 | `app/agents/research_agent/schema.py` | `ProductResearch` output contract + `ScrapedProductData` intermediate shape |
 | `app/agents/research_agent/scraper.py` | Playwright fetch + JSON-LD/OG/text extraction, cost-aware review-scroll escalation |
 | `app/agents/research_agent/prompts.py` | System + user prompt for the extraction call |
@@ -567,6 +673,7 @@ Worth understanding rather than just accepting the defaults:
 | `app/agents/research_agent/nodes.py` | Node functions + retry/validation routing |
 | `app/agents/research_agent/graph.py` | Graph assembly |
 | `app/agents/creative_strategy_agent/schema.py` | `CreativeDirection` output contract + `AudienceAngle`/`VisualTheme` sub-models |
+| `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure) |
 | `app/agents/creative_strategy_agent/prompts.py` | System + user prompt for the creative-generation call |
 | `app/agents/creative_strategy_agent/state.py` | LangGraph state TypedDict |
 | `app/agents/creative_strategy_agent/nodes.py` | Node functions, model-fallback chain, retry/validation routing |
@@ -595,6 +702,8 @@ Worth understanding rather than just accepting the defaults:
 | `scripts/test_live.py` | Standalone step-by-step debugging runner for Agent 1 |
 | `scripts/test_pipeline_live.py` | Chains Agent 1 into Agent 2 for two-stage testing |
 | `scripts/test_full_pipeline_live.py` | Chains all six agents for end-to-end testing, with per-stage early-exit flags and checkpointing |
+| `scripts/run_batch.py` | Bulk (or single-URL) entry point - Agents 1-5, always stops before Video Generation, writes the results manifest |
+| `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, prompts for confirmation before starting |
 | `main.py` | CLI runner for Agent 1, standalone |
 | `Product_research.md` | Agent 1 design narrative - challenges hit, decisions made, why |
 | `Creative_strategy.md` | Agent 2 design narrative - same format |
@@ -614,6 +723,16 @@ Worth understanding rather than just accepting the defaults:
   `scrape_node` will still "succeed" against a challenge page, just with
   junk `visible_text` - worth a minimum-text-length sanity check before
   extraction.
+- **Cross-run market-context persistence** (Agent 2): `market_context` is
+  cached in state for the duration of one `graph.ainvoke()` call, so
+  retries within a single run only pay for one Tavily fetch - but two
+  separate process invocations (e.g. a batch row re-run after a crash
+  before the creative-stage checkpoint was written) each start from
+  scratch and each pay the full Tavily cost again. Acceptable for now -
+  a few credits per re-fetch, and cheap even at bulk-CSV volume - but
+  worth persisting `market_context` itself in the flat-JSON checkpoint
+  rather than only the final `CreativeDirection` if Tavily volume ever
+  becomes a real constraint. See `Creative_strategy.md` Challenge 6.
 - **Typographic character normalization** (Agent 2): live output uses smart
   quotes/non-breaking hyphens/emoji (a gpt-oss-120b style tendency).
   Harmless in JSON, could matter later for ad-platform APIs or strict

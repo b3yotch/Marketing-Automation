@@ -6,7 +6,7 @@ Takes the `ProductResearch` object the Product Research Agent produces and
 returns ad creative direction for a paid social campaign: hooks, audience
 targeting angles, visual themes, captions, and marketing messaging. Second
 stage of the AI Product Creative Generation Workflow - its output is what the
-Prompt Generation Agent will consume next.
+Prompt Generation Agent consumes next.
 
 ## How it works
 
@@ -17,13 +17,15 @@ generate --> validate --+--> END (valid, or retries exhausted)
     +----- bump_retry <--+ (invalid, retries remain)
 ```
 
-1. **generate** (`nodes.py` + `llm.py`) - calls `structured_chat_groq`
-   against a primary model, falling back to a secondary model on ANY
-   failure (API error, rate limit, schema validation error) from the
-   primary. This fallback chain is deliberately separate from the retry loop
-   below - a transient provider failure isn't a signal that the *approach*
-   needs correcting, so it doesn't consume a retry or get a `previous_error`
-   message fed back into the prompt.
+1. **generate** (`nodes.py` + `llm.py` + `market_research.py`) - fetches
+   market/trend/competitor context via Tavily (best-effort, see Challenge 6),
+   then calls `structured_chat_groq` against a primary model, falling back
+   to a secondary model on ANY failure (API error, rate limit, schema
+   validation error) from the primary. The model-fallback chain is
+   deliberately separate from the retry loop below - a transient provider
+   failure isn't a signal that the *approach* needs correcting, so it
+   doesn't consume a retry or get a `previous_error` message fed back into
+   the prompt.
 2. **validate** - low bar, same philosophy as Agent 1: catch outright
    failures (no hooks, no captions at all), not grade creative quality.
    Deeper quality/consistency judgment belongs to the Review/Critic agent
@@ -68,6 +70,9 @@ eventual bulk-CSV layer - but per-call token usage here (one `ProductResearch`
 object in, one creative-direction object out) is nowhere near tight enough
 for token-per-minute limits to be the deciding factor between candidates.
 
+(Later note: Groq deprecated `llama-3.3-70b-versatile` on the free/developer
+tier on June 17, 2026. Fallback model switched to `openai/gpt-oss-20b`.)
+
 ### 2. Groq doesn't need Agent 1's Ollama workarounds - a second `llm.py` entry point, not a branch
 
 Groq's OpenAI-compatible API supports native `response_format` /
@@ -107,7 +112,10 @@ by making the prompt explicit that the two fields serve different purposes
 and must both be filled whenever either applies - `ungrounded_claims_flagged`
 lists the specific claims, `messaging_notes` explains why they're uncertain
 - with a direct instruction that writing a hedge in one is itself the signal
-to go back and populate the other.
+to go back and populate the other. Confirmed working on a real live run
+(Gurkha pant product): 7 specific claims correctly flagged, each traceable
+to either a market-trend inference or a features-to-benefit extension not
+directly stated in the research.
 
 ### 5. Captions occasionally ran past the char limit - normalized in code, not the prompt
 
@@ -118,6 +126,60 @@ increasingly insistent prompt about the 150-character caption limit, added a
 caption a few characters over is still usable creative material for a human
 to shorten; failing validation over it would waste a retry on otherwise-good
 output.
+
+### 6. Grounding creative strategy in current trends and competitors via Tavily
+
+The model's training cutoff means it has no idea what ad creative is
+actually working right now, or what competitors are currently saying. Added
+`market_research.py`: two Tavily searches per product, run concurrently via
+`asyncio.gather` (not sequentially) specifically to keep the added latency
+close to the cost of the *slower* of the two calls rather than their sum -
+a trend search (`topic="news"`, biases toward recent/dated content over
+evergreen pages) and a competitor search (`search_depth="advanced"`, since
+"who's out there and how are they positioned" is a harder synthesis question
+than a trend headline, worth the extra credit here specifically).
+
+Three design decisions made upfront rather than discovered the hard way:
+
+- **Best-effort, not blocking.** `fetch_market_context()` catches every
+  exception and returns `""` rather than propagating a failure - a slow or
+  down search API should never fail the whole creative-generation call over
+  what's fundamentally an enrichment step, not a hard dependency. Verified
+  with mocked failures (no API key configured, both searches raising) before
+  ever hitting the real API.
+- **Explicit anti-copying instruction.** Search results surface actual
+  competitor ad copy verbatim. The prompt is explicit that the model should
+  synthesize the *insight* (what angle is working, what's oversaturated),
+  never reuse a competitor's actual slogan or phrasing - otherwise the
+  agent's output risks being uncomfortably close to someone else's real ad
+  copy, a real problem for a tool meant to ship actual marketing content,
+  not just a style nitpick.
+- **Fetched once, cached in state - not once per retry.** `market_context`
+  doesn't change based on what the model got wrong last attempt, unlike
+  `previous_error`. `generate_node` checks `state.get("market_context")` and
+  only calls Tavily if it's still `None` (not yet fetched this run);
+  `""` (fetched, nothing useful came back) is a distinct, valid cached
+  value. Verified with a mocked retry sequence: two failed attempts followed
+  by a success only triggered one Tavily fetch, not three.
+
+Confirmed working on a real product page: total added latency was
+~11s including both searches, well within tolerable range, and the model
+visibly used the trend context in its output (an audience-angle rationale
+explicitly referenced "market research notes the pant's trending neutral
+color"), not just the base product research - so this isn't just
+plumbing that runs and gets ignored, it's actually changing the output.
+
+**Known nuance, not yet an issue:** the state-level caching only holds
+within one `graph.ainvoke()` call. Two separate script invocations (e.g. a
+first run that fails validation, followed by manually re-running the whole
+script) each start with `market_context: None` and each pay the full Tavily
+cost - confirmed via Tavily's own credit dashboard (3 credits per run x 2
+runs = 6, matching exactly). Acceptable for now given how cheap 3 credits is
+even at bulk-CSV volume, but worth revisiting once the bulk-CSV layer's
+checkpointing (already built for Agents 1/2/3 as flat-JSON-per-stage) is
+extended - persisting `market_context` in that checkpoint would mean
+resuming a crashed batch run doesn't re-spend Tavily credits on products
+that already had their market research fetched.
 
 ## Deliberately deferred (not gaps, decisions)
 
@@ -138,6 +200,9 @@ output.
   low (non-empty hooks/captions), same as Agent 1's non-empty-title bar.
   Real quality judgment belongs to the Review/Critic agent later in the
   pipeline, not duplicated here.
+- **Cross-run market-context persistence**: see Challenge 6's "known
+  nuance" above - deferred to the bulk-CSV layer's checkpointing rather than
+  solved inside this agent.
 
 ## Design decisions worth remembering for later agents
 
@@ -158,3 +223,8 @@ output.
   ungrounded_claims_flagged) still needs to be pinned down explicitly for a
   model** - describing them as alternatives to each other, even briefly,
   was enough for the model to reliably use only one.
+- **Cache anything fetched from an external API in state, keyed on "have we
+  already gotten this," not on the retry count** - a value that doesn't
+  change based on what a retry is correcting for (market context, unlike
+  previous_error) should be fetched once and reused, or a retry loop quietly
+  turns into N redundant external-API calls for every failed attempt.
