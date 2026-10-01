@@ -67,6 +67,7 @@ from app.agents.video_generation.graph import build_graph as build_video_generat
 from app.agents.image_generation.utils import slugify_url
 from app.core.checkpoint import clear_checkpoints, load_stage, save_stage
 from app.core.langgraph_checkpoint import run_checkpointed
+from app.core import observability as obs
 
 LANGGRAPH_CHECKPOINT_DB = "outputs/checkpoints/langgraph_checkpoints.db"
 
@@ -134,6 +135,7 @@ class ProductRunResult:
     stage_reached: str = "-"
     failed_stage: str | None = None
     error: str | None = None
+    trace_id: str | None = None  # Langfuse trace id - None when tracing isn't configured
 
     elapsed: dict[str, float] = field(default_factory=dict)
     total_elapsed_seconds: float = 0.0
@@ -250,11 +252,11 @@ async def run_product(
                 try:
                     r = await research_graph.ainvoke({"url": url, "retries": 0})
                 except Exception as exc:
-                    return _fail(result, "research", exc, t_start)
+                    return _fail(result, "research", exc, t_start, trace)
                 result.elapsed["research"] = time.perf_counter() - t
 
                 if r.get("error") or not r.get("research"):
-                    return _fail(result, "research", r.get("error"), t_start)
+                    return _fail(result, "research", r.get("error"), t_start, trace)
 
                 research = r["research"]
                 save_stage(
@@ -268,7 +270,7 @@ async def run_product(
             result.stage_reached = "research"
             dump(research)
             if not _should_run("creative", stop_after):
-                return _finish(result, t_start)
+                return _finish(result, t_start, trace)
 
             # ---- Stage 2: Creative Strategy ---------------------------------
             cached = _try_load(url, "creative", CreativeDirection, resume)
@@ -281,11 +283,11 @@ async def run_product(
                 try:
                     c = await creative_strategy_graph.ainvoke({"research": research, "retries": 0})
                 except Exception as exc:
-                    return _fail(result, "creative", exc, t_start)
+                    return _fail(result, "creative", exc, t_start, trace)
                 result.elapsed["creative"] = time.perf_counter() - t
 
                 if c.get("error") or not c.get("creative"):
-                    return _fail(result, "creative", c.get("error"), t_start)
+                    return _fail(result, "creative", c.get("error"), t_start, trace)
 
                 creative = c["creative"]
                 save_stage(
@@ -300,7 +302,7 @@ async def run_product(
             result.stage_reached = "creative"
             dump(creative)
             if not _should_run("prompts", stop_after):
-                return _finish(result, t_start)
+                return _finish(result, t_start, trace)
 
             # ---- Stage 3: Prompt Generation ---------------------------------
             cached = _try_load(url, "prompts", PromptGenerationOutput, resume)
@@ -313,11 +315,11 @@ async def run_product(
                 try:
                     p = await prompt_gen_graph.ainvoke({"creative": creative, "retries": 0})
                 except Exception as exc:
-                    return _fail(result, "prompts", exc, t_start)
+                    return _fail(result, "prompts", exc, t_start, trace)
                 result.elapsed["prompts"] = time.perf_counter() - t
 
                 if p.get("error") or not p.get("prompts"):
-                    return _fail(result, "prompts", p.get("error"), t_start)
+                    return _fail(result, "prompts", p.get("error"), t_start, trace)
 
                 prompts = p["prompts"]
                 save_stage(
@@ -333,7 +335,7 @@ async def run_product(
             result.themes_expected = len(prompts.prompt_sets)
             dump(prompts)
             if not _should_run("images", stop_after):
-                return _finish(result, t_start)
+                return _finish(result, t_start, trace)
 
             # ---- Stage 4: Image Generation ----------------------------------
             image_graph = build_image_generation_graph(checkpointer=lg_checkpointer)
@@ -345,13 +347,13 @@ async def run_product(
                     image_graph, image_config, {"prompts": prompts, "retries": 0}, "images"
                 )
             except Exception as exc:
-                return _fail(result, "images", exc, t_start)
+                return _fail(result, "images", exc, t_start, trace)
             result.elapsed["images"] = time.perf_counter() - t
 
             if img.get("error") and not img.get("images"):
-                return _fail(result, "images", img.get("error"), t_start)
+                return _fail(result, "images", img.get("error"), t_start, trace)
             if not img.get("images"):
-                return _fail(result, "images", None, t_start)
+                return _fail(result, "images", None, t_start, trace)
 
             images = img["images"]
             result.images = images
@@ -364,7 +366,7 @@ async def run_product(
             )
             dump(images)
             if not _should_run("selection", stop_after):
-                return _finish(result, t_start)
+                return _finish(result, t_start, trace)
 
             # ---- Stage 5: Image Selection (Critic) --------------------------
             cached = _try_load(url, "selection", ImageSelectionOutput, resume)
@@ -377,11 +379,11 @@ async def run_product(
                 try:
                     s = await image_selection_graph.ainvoke({"images": images, "retries": 0})
                 except Exception as exc:
-                    return _fail(result, "selection", exc, t_start)
+                    return _fail(result, "selection", exc, t_start, trace)
                 result.elapsed["selection"] = time.perf_counter() - t
 
                 if s.get("error") or not s.get("selection"):
-                    return _fail(result, "selection", s.get("error"), t_start)
+                    return _fail(result, "selection", s.get("error"), t_start, trace)
 
                 selection = s["selection"]
                 save_stage(url, "selection", selection, elapsed_seconds=result.elapsed["selection"])
@@ -398,7 +400,7 @@ async def run_product(
                 log(f"  ⚠ {len(result.selection_flags)} theme(s) selected below threshold")
             dump(selection)
             if not _should_run("videos", stop_after):
-                return _finish(result, t_start)
+                return _finish(result, t_start, trace)
 
             # ---- Stage 6: Video Generation ----------------------------------
             video_graph = build_video_generation_graph(checkpointer=lg_checkpointer)
@@ -413,13 +415,13 @@ async def run_product(
                     "videos",
                 )
             except Exception as exc:
-                return _fail(result, "videos", exc, t_start)
+                return _fail(result, "videos", exc, t_start, trace)
             result.elapsed["videos"] = time.perf_counter() - t
 
             if v.get("error") and not v.get("videos"):
-                return _fail(result, "videos", v.get("error"), t_start)
+                return _fail(result, "videos", v.get("error"), t_start, trace)
             if not v.get("videos"):
-                return _fail(result, "videos", None, t_start)
+                return _fail(result, "videos", None, t_start, trace)
 
             videos = v["videos"]
             result.videos = videos
@@ -432,14 +434,14 @@ async def run_product(
                 f"({result.videos_generated} video(s))"
             )
             dump(videos)
-            return _finish(result, t_start)
+            return _finish(result, t_start, trace)
 
     except Exception as exc:
         # Backstop for anything outside a stage guard (checkpointer setup,
         # a checkpoint file that won't deserialize, disk full mid-save).
         # A batch caller must never have to wrap this call in its own
         # try/except to survive one bad row.
-        return _fail(result, result.failed_stage or "unexpected", exc, t_start)
+        return _fail(result, result.failed_stage or "unexpected", exc, t_start, trace)
 
 
 async def clear_all_checkpoints(url: str) -> None:
