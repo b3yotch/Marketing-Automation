@@ -1,0 +1,59 @@
+# Ruff configuration for the video-gen project.
+# Schema: https://docs.astral.sh/ruff/settings/
+
+target-version = "py312"
+line-length = 100
+# App code lives directly in the repo root, so first-party imports resolve to it.
+src = ["."]
+
+exclude = [
+    ".env",
+    ".git",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "myenv",
+    "node_modules",
+    "__pycache__",
+]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+
+[lint]
+# Default pycodestyle/pyflakes set + isort, bugbear, pyupgrade,
+# comprehensions, simplifications, and ruff-specific rules.
+select = [
+    "E4",   # pycodestyle errors (subset used by the formatter)
+    "E7",   # pycodestyle (statements/comparison issues)
+    "E9",   # pycodestyle (runtime errors)
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific rules
+]
+
+ignore = [
+    # Files in app/, scripts/, and root-level test scripts currently use
+    # `sys.path` injection + `# noqa: E402`. Keep import-position checks off
+    # until those are cleaned up.
+    "E402",
+    # Long example URL / prompt strings are common in agent prompts.
+    "E501",
+    # Loosely-typed TypedDict state dicts trigger RUF012 (mutable class
+    # attribute annotations). Ignore until states are refactored.
+    "RUF012",
+]
+
+[lint.per-file-ignores]
+# Allow unused imports in __init__ / re-export style files.
+"__init__.py" = ["F401"]
+# Test scripts: asserts and broad exceptions are fine.
+"test*.py" = ["B011", "SIM117"]
+
+[lint.isort]
+known-first-party = ["app"]

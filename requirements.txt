@@ -1,9 +1,34 @@
-langgraph>=0.2.60
-langchain-core>=0.3.28
-ollama>=0.4.4
-playwright>=1.49.0
-pydantic>=2.10.0
-pydantic-settings>=2.7.0
-beautifulsoup4>=4.12.3
-python-dotenv>=1.0.1
-tavily-python
+# Runtime dependencies (synced with pyproject.toml dependencies).
+# Core agent framework
+langgraph>=1.2
+langchain-core>=1.4
+langgraph-checkpoint-sqlite>=3.1
+
+# LLM clients
+groq>=1.5
+ollama>=0.6
+
+# Web scraping
+playwright>=1.61
+beautifulsoup4>=4.15
+requests>=2.34
+tavily-python>=0.8
+
+# Data / config
+pydantic>=2.13
+pydantic-settings>=2.14
+python-dotenv>=1.2
+
+# Persistence
+aiosqlite>=0.22
+
+# Observability
+langfuse>=5.0
+
+# Image handling
+pillow>=12.3
+
+# Dev tooling
+pytest>=9.1
+pytest-asyncio>=1.4
+ruff>=0.14

@@ -1,0 +1,52 @@
+[project]
+name = "video-gen"
+version = "0.1.0"
+description = "Agentic product video generation pipeline (research, strategy, prompts, image/video generation)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    # Core agent framework
+    "langgraph>=1.2",
+    "langchain-core>=1.4",
+    "langgraph-checkpoint-sqlite>=3.1",
+    # LLM clients
+    "groq>=1.5",
+    "ollama>=0.6",
+    # Web scraping
+    "playwright>=1.61",
+    "beautifulsoup4>=4.15",
+    "requests>=2.34",
+    "tavily-python>=0.8",
+    # Data / config
+    "pydantic>=2.13",
+    "pydantic-settings>=2.14",
+    "python-dotenv>=1.2",
+    # Persistence
+    "aiosqlite>=0.22",
+    # Observability
+    "langfuse>=5.0",
+    # Image handling
+    "pillow>=12.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+namespaces = true
+
+# Lint/format config lives in ruff.toml
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["app", "scripts", "tests"]
