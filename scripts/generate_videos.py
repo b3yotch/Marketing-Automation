@@ -25,21 +25,43 @@ Three ways to say which products:
     python scripts/generate_videos.py --from-results outputs/batch_results_X.csv --rows 3,7,12-15
 
 `--rows` is 1-based over the *data* rows of the manifest (row 1 = first
-product, not the header), and accepts ranges. `--from-results` without
-`--rows` takes every row whose status is ok, which is the "animate
-everything that worked" case.
+product, not the header), and accepts ranges.
 
 Because a mistake here costs hours rather than seconds, the script prints
 the selection and a time estimate and asks for confirmation before
 starting. `--yes` skips that, for when this is driven from another script
 rather than typed.
+
+## Human-in-the-loop gate
+
+Typing specific row numbers (`--rows`) or specific URLs (positional args,
+`--csv`) IS the human decision - no further gate is applied to those,
+because choosing them one by one already required a person to look at
+each one.
+
+`--from-results <manifest>` with **no** `--rows`, though, means "animate
+everything that came back ok" - the one path that can silently commit
+every GPU-hour in the batch to Agent 5's judgment with no human ever
+having looked at a single selected image. That path refuses to run unless
+you also pass either:
+
+    --approvals outputs/approvals_<ts>.csv   (written by scripts/review.py)
+    --force                                  (explicit, deliberate bypass)
+
+`scripts/review.py` is what produces an approvals file: it walks every
+`status=ok` row in a results manifest, shows you the selection-threshold
+flags Agent 5 raised, and asks approve/reject per product. When
+`--approvals` is given, rows marked anything other than "approved" are
+dropped from the run (and printed as skipped) even if they'd otherwise
+have been included - this applies on top of `--rows` too, if you pass
+both, so an approvals file can also work as a safety net on a hand-picked
+list.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import sys
 import time
 from pathlib import Path
@@ -47,7 +69,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.manifest import ManifestWriter, default_manifest_path, read_urls  # noqa: E402
+from observability import observability as obs  # noqa: E402
+from app.core.manifest import (  # noqa: E402
+    ManifestWriter,
+    default_manifest_path,
+    read_manifest_rows,
+    read_urls,
+)
 from app.core.pipeline import (  # noqa: E402
     LANGGRAPH_CHECKPOINT_DB,
     ProductRunResult,
@@ -91,13 +119,8 @@ def _parse_rows(spec: str) -> list[int]:
     return picked
 
 
-def _read_manifest(path: Path) -> list[dict]:
-    with path.open(newline="", encoding="utf-8-sig") as fh:
-        return list(csv.DictReader(fh))
-
-
 def _select_from_manifest(path: Path, rows_spec: str | None) -> list[str]:
-    rows = _read_manifest(path)
+    rows = read_manifest_rows(path)
     if not rows:
         raise ValueError(f"{path} has no data rows")
 
@@ -116,6 +139,36 @@ def _select_from_manifest(path: Path, rows_spec: str | None) -> list[str]:
         if url not in out:
             out.append(url)
     return out
+
+
+def _load_approvals(path: Path) -> dict[str, str]:
+    """url -> decision ('approved' | 'rejected' | whatever scripts/review.py wrote),
+    last entry wins if a URL appears more than once in the file."""
+    decisions: dict[str, str] = {}
+    for row in read_manifest_rows(path):
+        url = (row.get("url") or "").strip()
+        decision = (row.get("decision") or "").strip().lower()
+        if url:
+            decisions[url] = decision
+    return decisions
+
+
+def _apply_approvals(urls: list[str], approvals_path: Path) -> list[str]:
+    decisions = _load_approvals(approvals_path)
+    approved, skipped = [], []
+    for url in urls:
+        decision = decisions.get(url)
+        if decision == "approved":
+            approved.append(url)
+        else:
+            skipped.append((url, decision or "not reviewed"))
+
+    if skipped:
+        print(f"\n⚠ {len(skipped)} product(s) skipped by the approvals gate:")
+        for url, reason in skipped:
+            print(f"  [{reason}] {url}")
+
+    return approved
 
 
 def _print_summary(results: list[ProductRunResult], total: int, elapsed: float, out_path: Path) -> None:
@@ -161,6 +214,16 @@ async def main() -> None:
         default=None,
         help="With --from-results: 1-based data rows to animate, e.g. '3,7,12-15'. Omit to take every ok row.",
     )
+    parser.add_argument(
+        "--approvals",
+        default=None,
+        help="An approvals CSV from scripts/review.py - rows not marked 'approved' are dropped from the run",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the HITL approvals requirement for --from-results with no --rows (use deliberately)",
+    )
     parser.add_argument("--out", default=None, help="Manifest CSV path (default: outputs/video_results_<timestamp>.csv)")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing checkpoints and recompute every stage")
     parser.add_argument("--verbose", action="store_true", help="Print each stage's full JSON output")
@@ -169,6 +232,20 @@ async def main() -> None:
 
     if args.rows and not args.from_results:
         parser.error("--rows only makes sense with --from-results")
+
+    # The HITL gate: "--from-results with no --rows" is the one path that
+    # can commit every GPU-hour in a batch to Agent 5's judgment with no
+    # human ever having looked at a selected image. Everything else
+    # (typing URLs, --csv, or hand-picked --rows) already required a
+    # person to choose each one, so it isn't gated further here.
+    if args.from_results and not args.rows and not args.approvals and not args.force:
+        parser.error(
+            "--from-results with no --rows selects every successful product in the "
+            "manifest with no review step. Pass one of:\n"
+            "  --rows <n,n,n>              review and pick specific rows yourself\n"
+            "  --approvals <csv>           from `python scripts/review.py <manifest>`\n"
+            "  --force                     explicit bypass - no review at all"
+        )
 
     urls: list[str] = []
     for url in args.urls:
@@ -186,6 +263,12 @@ async def main() -> None:
     if not urls:
         parser.error("No URLs given - pass them positionally, or use --csv / --from-results")
 
+    if args.approvals:
+        urls = _apply_approvals(urls, Path(args.approvals))
+        if not urls:
+            print("\nNo products remain after the approvals gate. Nothing to do.")
+            return
+
     estimate = len(urls) * SECONDS_PER_PRODUCT_ESTIMATE
     print(f"{len(urls)} product(s) selected for video generation:")
     for i, url in enumerate(urls, start=1):
@@ -200,7 +283,8 @@ async def main() -> None:
             return
 
     out_path = Path(args.out) if args.out else default_manifest_path(PROJECT_ROOT, "video")
-    print(f"\nManifest: {out_path}\n")
+    print(f"\n{obs.startup_check()}")
+    print(f"Manifest: {out_path}\n")
 
     results: list[ProductRunResult] = []
     start = time.perf_counter()
@@ -219,6 +303,7 @@ async def main() -> None:
                         checkpointer=checkpointer,
                         verbose=args.verbose,
                         prefix=prefix,
+                        run_label="video",
                     )
 
                     results.append(result)

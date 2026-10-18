@@ -67,7 +67,7 @@ from app.agents.video_generation.graph import build_graph as build_video_generat
 from app.agents.image_generation.utils import slugify_url
 from app.core.checkpoint import clear_checkpoints, load_stage, save_stage
 from app.core.langgraph_checkpoint import run_checkpointed
-from app.core import observability as obs
+from observability import observability as obs
 
 LANGGRAPH_CHECKPOINT_DB = "outputs/checkpoints/langgraph_checkpoints.db"
 
@@ -173,16 +173,38 @@ def _should_run(stage: str, stop_after: str) -> bool:
     return STAGE_ORDER.index(stage) <= STAGE_ORDER.index(stop_after)
 
 
-def _fail(result: ProductRunResult, stage: str, error: Any, t_start: float) -> ProductRunResult:
+def _fail(result: ProductRunResult, stage: str, error: Any, t_start: float, trace: Any = None) -> ProductRunResult:
     result.status = "failed"
     result.failed_stage = stage
     result.error = str(error) if error else f"{stage} produced no output and no error message"
     result.total_elapsed_seconds = time.perf_counter() - t_start
+
+    # Stage-level elapsed for the failed stage isn't always in result.elapsed
+    # (an exception raised before that stage finished never gets to write
+    # it) - fall back to "time since the whole product started" rather than
+    # leave the span with no duration at all. Imprecise for a failure deep
+    # into a multi-stage run, honest enough for a failure in stage 1.
+    stage_elapsed = result.elapsed.get(stage, result.total_elapsed_seconds)
+    obs.log_stage(trace, stage, ok=False, elapsed_seconds=stage_elapsed, error=result.error)
+    obs.finish_trace(
+        trace,
+        status="failed",
+        stage_reached=stage,
+        selection_flag_count=len(result.selection_flags),
+    )
+    obs.flush()
     return result
 
 
-def _finish(result: ProductRunResult, t_start: float) -> ProductRunResult:
+def _finish(result: ProductRunResult, t_start: float, trace: Any = None) -> ProductRunResult:
     result.total_elapsed_seconds = time.perf_counter() - t_start
+    obs.finish_trace(
+        trace,
+        status="ok",
+        stage_reached=result.stage_reached,
+        selection_flag_count=len(result.selection_flags),
+    )
+    obs.flush()
     return result
 
 
@@ -204,13 +226,17 @@ async def run_product(
     checkpointer: Any = None,
     verbose: bool = False,
     prefix: str = "",
+    run_label: str = "batch",
 ) -> ProductRunResult:
     """
     Runs stages 1..`stop_after` for one URL and returns what happened.
 
     Never raises for a stage failure and never calls sys.exit - see the
     module docstring. `prefix` is prepended to every progress line so a
-    batch can tag output with '[12/50] '.
+    batch can tag output with '[12/50] '. `run_label` ("batch" | "video")
+    tags the Langfuse trace so the two commands' runs are distinguishable
+    in Langfuse's UI/filters - it has no effect when tracing isn't
+    configured.
     """
     if stop_after not in STAGE_ORDER:
         raise ValueError(f"stop_after must be one of {STAGE_ORDER}, got {stop_after!r}")
@@ -218,6 +244,13 @@ async def run_product(
     result = ProductRunResult(url=url)
     resume = not fresh
     t_start = time.perf_counter()
+
+    # Defined before the try block so the outer except (line ~450) can
+    # reference it even if something fails before a single stage runs -
+    # obs.start_trace() never raises (it catches internally), so this
+    # assignment itself can't be the thing that fails.
+    trace = obs.start_trace(url, run_label)
+    result.trace_id = obs.trace_id(trace)
 
     def log(msg: str) -> None:
         print(f"{prefix}{msg}", flush=True)
@@ -247,7 +280,9 @@ async def run_product(
                 research, meta = cached
                 result.elapsed["research"] = meta.get("elapsed_seconds", 0.0)
                 log("  research   ↺ checkpoint")
+                obs.log_stage(trace, "research", ok=True, elapsed_seconds=0.0, cached=True)
             else:
+                obs.begin_stage(trace, "research")
                 t = time.perf_counter()
                 try:
                     r = await research_graph.ainvoke({"url": url, "retries": 0})
@@ -265,6 +300,7 @@ async def run_product(
                     retries=r.get("retries", 0),
                 )
                 log(f"  research   ✓ {result.elapsed['research']:.1f}s")
+                obs.log_stage(trace, "research", ok=True, elapsed_seconds=result.elapsed["research"])
 
             result.research = research
             result.stage_reached = "research"
@@ -278,7 +314,9 @@ async def run_product(
                 creative, meta = cached
                 result.elapsed["creative"] = meta.get("elapsed_seconds", 0.0)
                 log("  creative   ↺ checkpoint")
+                obs.log_stage(trace, "creative", ok=True, elapsed_seconds=0.0, cached=True)
             else:
+                obs.begin_stage(trace, "creative")
                 t = time.perf_counter()
                 try:
                     c = await creative_strategy_graph.ainvoke({"research": research, "retries": 0})
@@ -297,6 +335,10 @@ async def run_product(
                     model_used=c.get("model_used"),
                 )
                 log(f"  creative   ✓ {result.elapsed['creative']:.1f}s")
+                obs.log_stage(
+                    trace, "creative", ok=True, elapsed_seconds=result.elapsed["creative"],
+                    extra={"model_used": c.get("model_used")},
+                )
 
             result.creative = creative
             result.stage_reached = "creative"
@@ -310,7 +352,9 @@ async def run_product(
                 prompts, meta = cached
                 result.elapsed["prompts"] = meta.get("elapsed_seconds", 0.0)
                 log("  prompts    ↺ checkpoint")
+                obs.log_stage(trace, "prompts", ok=True, elapsed_seconds=0.0, cached=True)
             else:
+                obs.begin_stage(trace, "prompts")
                 t = time.perf_counter()
                 try:
                     p = await prompt_gen_graph.ainvoke({"creative": creative, "retries": 0})
@@ -329,6 +373,10 @@ async def run_product(
                     model_used=p.get("model_used"),
                 )
                 log(f"  prompts    ✓ {result.elapsed['prompts']:.1f}s")
+                obs.log_stage(
+                    trace, "prompts", ok=True, elapsed_seconds=result.elapsed["prompts"],
+                    extra={"model_used": p.get("model_used")},
+                )
 
             result.prompts = prompts
             result.stage_reached = "prompts"
@@ -341,6 +389,7 @@ async def run_product(
             image_graph = build_image_generation_graph(checkpointer=lg_checkpointer)
             image_config = {"configurable": {"thread_id": f"images:{slugify_url(url)}"}}
 
+            obs.begin_stage(trace, "images")
             t = time.perf_counter()
             try:
                 img = await run_checkpointed(
@@ -364,6 +413,10 @@ async def run_product(
                 f"  images     ✓ {result.elapsed['images']:.1f}s "
                 f"({result.total_images} images, themes {result.themes_fraction})"
             )
+            obs.log_stage(
+                trace, "images", ok=True, elapsed_seconds=result.elapsed["images"],
+                extra={"total_images": result.total_images, "themes": result.themes_fraction},
+            )
             dump(images)
             if not _should_run("selection", stop_after):
                 return _finish(result, t_start, trace)
@@ -374,7 +427,9 @@ async def run_product(
                 selection, meta = cached
                 result.elapsed["selection"] = meta.get("elapsed_seconds", 0.0)
                 log("  selection  ↺ checkpoint")
+                obs.log_stage(trace, "selection", ok=True, elapsed_seconds=0.0, cached=True)
             else:
+                obs.begin_stage(trace, "selection")
                 t = time.perf_counter()
                 try:
                     s = await image_selection_graph.ainvoke({"images": images, "retries": 0})
@@ -388,6 +443,7 @@ async def run_product(
                 selection = s["selection"]
                 save_stage(url, "selection", selection, elapsed_seconds=result.elapsed["selection"])
                 log(f"  selection  ✓ {result.elapsed['selection']:.1f}s")
+                obs.log_stage(trace, "selection", ok=True, elapsed_seconds=result.elapsed["selection"])
 
             result.selection = selection
             result.stage_reached = "selection"
@@ -406,6 +462,7 @@ async def run_product(
             video_graph = build_video_generation_graph(checkpointer=lg_checkpointer)
             video_config = {"configurable": {"thread_id": f"videos:{slugify_url(url)}"}}
 
+            obs.begin_stage(trace, "videos")
             t = time.perf_counter()
             try:
                 v = await run_checkpointed(
@@ -432,6 +489,10 @@ async def run_product(
             log(
                 f"  videos     ✓ {result.elapsed['videos']:.1f}s "
                 f"({result.videos_generated} video(s))"
+            )
+            obs.log_stage(
+                trace, "videos", ok=True, elapsed_seconds=result.elapsed["videos"],
+                extra={"videos_generated": result.videos_generated},
             )
             dump(videos)
             return _finish(result, t_start, trace)

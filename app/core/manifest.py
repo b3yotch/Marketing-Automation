@@ -39,6 +39,9 @@ COLUMNS = [
     "videos_generated", # blank when video was never attempted
     "elapsed_seconds",
     "finished_at",      # UTC, so a long batch's row ordering is auditable
+    "trace_id",         # Langfuse trace id - blank when tracing isn't configured;
+                         # scripts/review.py uses this to attach the HITL decision
+                         # to the right trace without needing the original object
 ]
 
 
@@ -84,9 +87,17 @@ class ManifestWriter:
                 ),
                 "elapsed_seconds": f"{result.total_elapsed_seconds:.1f}",
                 "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "trace_id": result.trace_id or "",
             }
         )
         self._fh.flush()
+
+
+def read_manifest_rows(path: Path) -> list[dict]:
+    """Shared by generate_videos.py and scripts/review.py - both need the
+    same 'open a results manifest as plain dicts' operation."""
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
 
 
 def default_manifest_path(project_root: Path, kind: str) -> Path:

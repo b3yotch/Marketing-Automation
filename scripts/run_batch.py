@@ -55,6 +55,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from observability import observability as obs  # noqa: E402
 from app.core.manifest import ManifestWriter, default_manifest_path, read_urls  # noqa: E402
 from app.core.pipeline import (  # noqa: E402
     LANGGRAPH_CHECKPOINT_DB,
@@ -112,9 +113,10 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     print(f"\nManifest: {out_path}")
     if ok:
         print(
-            "Next: review the selected images, then\n"
+            "Next:\n"
+            f"  python scripts/review.py {out_path}\n"
             "  python scripts/generate_videos.py --from-results "
-            f"{out_path} --rows <n,n,n>"
+            f"{out_path} --approvals <approvals.csv>"
         )
 
 
@@ -157,6 +159,7 @@ async def main() -> None:
     out_path = Path(args.out) if args.out else default_manifest_path(PROJECT_ROOT, "batch")
 
     print(f"{len(urls)} product(s) to process, through stage '{args.stop_after}'.")
+    print(obs.startup_check())
     print(f"Manifest: {out_path}\n")
 
     results: list[ProductRunResult] = []
@@ -180,6 +183,7 @@ async def main() -> None:
                         checkpointer=checkpointer,
                         verbose=args.verbose,
                         prefix=prefix,
+                        run_label="batch",
                     )
 
                     results.append(result)
