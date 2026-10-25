@@ -63,7 +63,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.agents.image_selection_agent.schema import ImageSelectionOutput  # noqa: E402
-from app.core import observability as obs  # noqa: E402
+from observability import observability as obs  # noqa: E402
 from app.core.checkpoint import load_stage  # noqa: E402
 from app.core.manifest import read_manifest_rows  # noqa: E402
 
