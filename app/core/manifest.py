@@ -30,9 +30,11 @@ from app.core.pipeline import ProductRunResult
 
 COLUMNS = [
     "url",
-    "status",           # ok | failed
+    "status",           # ok | failed | blocked (failed a guardrail)
     "stage_reached",    # last stage that completed
-    "error",            # populated only on failure
+    "error",            # populated only on failure/block
+    "guardrail",        # invalid_page | unsafe | guard_error; blank when not blocked
+    "guardrail_reason", # human-readable verdict from Llama Guard / page validity
     "themes_completed", # "2/3"
     "total_images",
     "selection_flags",  # themes that came back selected_below_threshold
@@ -77,6 +79,8 @@ class ManifestWriter:
                 "status": result.status,
                 "stage_reached": result.failed_stage or result.stage_reached,
                 "error": (result.error or "").replace("\n", " ")[:500],
+                "guardrail": result.guardrail_blocked_by or "",
+                "guardrail_reason": (result.guardrail_reason or "").replace("\n", " ")[:300],
                 "themes_completed": result.themes_fraction,
                 "total_images": result.total_images,
                 # "; " not "," so the field stays readable even though the

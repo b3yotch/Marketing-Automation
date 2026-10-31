@@ -36,6 +36,16 @@ the normal end of the pipeline: video generation is a separate, opt-in
 second pass (~33 min/product on the target hardware) run against a chosen
 subset, not something a bulk run should ever decide to spend on by itself.
 
+Guardrails (`research_agent/guardrails.py`) run as a gate between Stage 1
+and Stage 2, never as a seventh stage: a product that fails page validity
+or Llama Guard is reported with `status="blocked"` and never reaches
+Creative Strategy, Prompt Generation, Image Generation, or video. The
+verdict is checkpointed like the stages around it, so a resumed batch
+doesn't re-pay for a repeated Llama Guard call - but a `guard_error`
+(Ollama unreachable, unparseable verdict) is deliberately NOT persisted,
+because that's an infrastructure failure worth retrying on the next run
+rather than a property of the product.
+
 The `checkpointer` parameter exists so a batch can open ONE AsyncSqliteSaver
 connection across all rows instead of opening and closing one per product.
 Passing None keeps the original behavior (open one for this product,
@@ -55,6 +65,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agents.research_agent.graph import research_graph
+from app.agents.research_agent.guardrails import GuardrailResult, check_guardrails
 from app.agents.research_agent.schema import ProductResearch
 from app.agents.creative_strategy_agent.graph import creative_strategy_graph
 from app.agents.creative_strategy_agent.schema import CreativeDirection
@@ -131,10 +142,12 @@ class ProductRunResult:
     """
 
     url: str
-    status: str = "ok"  # "ok" | "failed"
+    status: str = "ok"  # "ok" | "failed" | "blocked" (failed a guardrail)
     stage_reached: str = "-"
     failed_stage: str | None = None
     error: str | None = None
+    guardrail_blocked_by: str | None = None  # "invalid_page" | "unsafe" | "guard_error"
+    guardrail_reason: str | None = None
     trace_id: str | None = None  # Langfuse trace id - None when tracing isn't configured
 
     elapsed: dict[str, float] = field(default_factory=dict)
@@ -307,6 +320,77 @@ async def run_product(
             dump(research)
             if not _should_run("creative", stop_after):
                 return _finish(result, t_start, trace)
+
+            # ---- Guardrails: gate between Research and Creative --------------
+            # Not a stage in STAGE_ORDER - nothing downstream can be reached
+            # without passing this, and stop_after="research" legitimately
+            # skips it (no point spending a model call when creative won't
+            # run). Checkpointed on its own so a resumed batch doesn't call
+            # Llama Guard twice for the same product.
+            cached = _try_load(url, "guardrails", GuardrailResult, resume)
+            if cached:
+                guard, meta = cached
+                result.elapsed["guardrails"] = meta.get("elapsed_seconds", 0.0)
+                log("  guardrails ↺ checkpoint")
+                obs.log_stage(
+                    trace, "guardrails", ok=guard.passed, elapsed_seconds=0.0,
+                    cached=True, error=guard.reason,
+                )
+            else:
+                obs.begin_stage(trace, "guardrails")
+                t = time.perf_counter()
+                try:
+                    guard = await check_guardrails(research)
+                except Exception as exc:
+                    # check_guardrails only catches its own LlamaGuardError;
+                    # an Ollama outage (ConnectionError/ResponseError) would
+                    # otherwise escape to the outer handler and be reported
+                    # as an "unexpected" pipeline failure. Fail closed here
+                    # instead, and don't checkpoint it - see below.
+                    guard = GuardrailResult(
+                        source_url=url,
+                        passed=False,
+                        blocked_by="guard_error",
+                        reason=f"Guardrail check could not run, failing closed: {exc}",
+                    )
+                result.elapsed["guardrails"] = time.perf_counter() - t
+
+                if guard.blocked_by != "guard_error":
+                    # A real verdict (pass, invalid page, or unsafe) is a
+                    # property of this product and safe to resume against.
+                    # An infrastructure error is not - caching it would keep
+                    # blocking the product on every later run until --fresh.
+                    save_stage(
+                        url, "guardrails", guard,
+                        elapsed_seconds=result.elapsed["guardrails"],
+                    )
+
+                log(
+                    "  guardrails ✓"
+                    if guard.passed
+                    else f"  guardrails ✗ {guard.blocked_by}: {guard.reason}"
+                )
+                obs.log_stage(
+                    trace, "guardrails", ok=guard.passed,
+                    elapsed_seconds=result.elapsed["guardrails"],
+                    error=guard.reason,
+                    extra={"blocked_by": guard.blocked_by},
+                )
+
+            result.guardrail_blocked_by = guard.blocked_by
+            result.guardrail_reason = guard.reason
+            if not guard.passed:
+                # A guardrail rejection is an expected outcome, not a broken
+                # stage: report it as "blocked" so the manifest/summary can
+                # tell "this product was unsuitable" apart from "this run
+                # broke", and stop without touching any later stage.
+                result.status = "blocked"
+                result.stage_reached = "research"
+                result.error = guard.reason
+                result.total_elapsed_seconds = time.perf_counter() - t_start
+                obs.finish_trace(trace, status="blocked", stage_reached="research")
+                obs.flush()
+                return result
 
             # ---- Stage 2: Creative Strategy ---------------------------------
             cached = _try_load(url, "creative", CreativeDirection, resume)

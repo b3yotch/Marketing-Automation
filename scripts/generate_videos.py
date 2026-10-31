@@ -175,13 +175,21 @@ def _print_summary(results: list[ProductRunResult], total: int, elapsed: float, 
     print(f"\n{'=' * 70}\nVIDEO RUN SUMMARY\n{'=' * 70}")
 
     ok = [r for r in results if r.ok]
-    failed = [r for r in results if not r.ok]
+    blocked = [r for r in results if r.status == "blocked"]
+    failed = [r for r in results if r.status == "failed"]
 
     print(f"Processed:  {len(results)}/{total}")
     print(f"Succeeded:  {len(ok)}")
+    print(f"Blocked:    {len(blocked)}")
     print(f"Failed:     {len(failed)}")
     print(f"Videos:     {sum(r.videos_generated or 0 for r in results)}")
     print(f"Wall clock: {_fmt_duration(elapsed)}")
+
+    if blocked:
+        print("\nBlocked by guardrails (not pipeline failures):")
+        for r in blocked:
+            print(f"  [{r.guardrail_blocked_by}] {r.url}")
+            print(f"      {(r.guardrail_reason or '')[:160]}")
 
     # A product can succeed as a run while producing zero videos - every
     # theme skipped for want of a source image, or retries exhausted (and
@@ -313,6 +321,13 @@ async def main() -> None:
                         print(
                             f"{prefix}✓ {result.videos_generated} video(s) in "
                             f"{_fmt_duration(result.total_elapsed_seconds)}\n",
+                            flush=True,
+                        )
+                    elif result.status == "blocked":
+                        print(
+                            f"{prefix}⛔ blocked at guardrails "
+                            f"({result.guardrail_blocked_by}): "
+                            f"{(result.guardrail_reason or '')[:120]}\n",
                             flush=True,
                         )
                     else:

@@ -7,8 +7,8 @@ prompts, on the way to generating marketing images/videos automatically.
 ## Pipeline
 
 ```
-[URL] --> Agent 1: Product Research --> Agent 2: Creative Strategy --> Agent 3: Prompt Generation --> Agent 4: Image Generation (ComfyUI) --> Agent 5: Image Selection (Critic) --> Agent 6: Video Generation (ComfyUI)
-              (done)                          (done)                        (done)                              (done)                                        (done)                                              (done)
+[URL] --> Agent 1: Product Research --> Guardrails (page validity + Llama Guard) --> Agent 2: Creative Strategy --> Agent 3: Prompt Generation --> Agent 4: Image Generation (ComfyUI) --> Agent 5: Image Selection (Critic) --> Agent 6: Video Generation (ComfyUI)
+              (done)                          (gate, not an agent)                          (done)                        (done)                              (done)                                        (done)                                              (done)
 ```
 
 Video generation was originally planned as part of a combined Agent 4
@@ -708,6 +708,8 @@ Worth understanding rather than just accepting the defaults:
 | `nav_attempt_timeout_ms` | 10000 | Per-strategy navigation timeout, separate from `scrape_timeout_ms`. Without this, a single slow strategy (`networkidle` on a page with persistent background traffic) could burn the entire scrape budget before falling through to a faster fallback strategy. |
 | `review_wait_timeout_ms` | 4000 | How long to wait for a review selector to appear after the scroll-trigger pass, before giving up and calling it `review_extraction_method: "none"`. |
 | `max_extraction_retries` | 2 | Agent 1's retry budget. |
+| `llama_guard_model` | `llama-guard3:1b` (Ollama, local) | The gate between Agents 1 and 2. Must be a Llama Guard checkpoint - its `safe`/`unsafe\nS1,S2` reply contract is parsed natively, not through the project's JSON-schema prompting. |
+| `min_valid_extraction_confidence` | 0.4 | Page-validity half of the same gate: below this self-reported Agent 1 confidence, the product is blocked as `invalid_page` before Llama Guard is even called. |
 | `groq_primary_model` / `groq_fallback_model` | `openai/gpt-oss-120b` / `openai/gpt-oss-20b` | Agent 2's model chain - see `Creative_strategy.md` Challenge 1 for the comparison that produced the primary choice. |
 | `groq_temperature` | 0.7 | Higher than Agent 1's 0.2 - Agent 2 is a creative task, not extraction, so more variance is wanted rather than suppressed. |
 | `max_creative_retries` | 2 | Agent 2's retry budget. |
@@ -730,7 +732,7 @@ Worth understanding rather than just accepting the defaults:
 |---|---|
 | `app/core/config.py` | Env-driven settings for all six agents |
 | `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) |
-| `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5) |
+| `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5, plus the guardrail verdict) |
 | `app/core/langgraph_checkpoint.py` | LangGraph-native resume helper (`run_checkpointed`), used by Agents 4 and 6 |
 | `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; never raises past a stage boundary, returns a `ProductRunResult` instead |
 | `app/core/manifest.py` | `ManifestWriter` (per-row-flushed results CSV) + `read_urls()` (accepts a bare URL or a CSV) |
@@ -741,6 +743,7 @@ Worth understanding rather than just accepting the defaults:
 | `app/agents/research_agent/state.py` | LangGraph state TypedDict |
 | `app/agents/research_agent/nodes.py` | Node functions + retry/validation routing |
 | `app/agents/research_agent/graph.py` | Graph assembly |
+| `app/agents/research_agent/guardrails.py` | `check_guardrails()` - page-validity heuristic + Llama Guard 3 classification, called by `pipeline.py` between Agents 1 and 2 (not a graph node) |
 | `app/agents/creative_strategy_agent/schema.py` | `CreativeDirection` output contract + `AudienceAngle`/`VisualTheme` sub-models |
 | `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure) |
 | `app/agents/creative_strategy_agent/prompts.py` | System + user prompt for the creative-generation call |

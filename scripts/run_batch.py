@@ -81,11 +81,13 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     print(f"\n{'=' * 70}\nBATCH SUMMARY\n{'=' * 70}")
 
     ok = [r for r in results if r.ok]
-    failed = [r for r in results if not r.ok]
+    blocked = [r for r in results if r.status == "blocked"]
+    failed = [r for r in results if r.status == "failed"]
     not_reached = total_urls - len(results)
 
     print(f"Processed:   {len(results)}/{total_urls}")
     print(f"Succeeded:   {len(ok)}")
+    print(f"Blocked:     {len(blocked)}")
     print(f"Failed:      {len(failed)}")
     if not_reached:
         print(f"Not reached: {not_reached} (interrupted)")
@@ -93,6 +95,12 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     if ok:
         print(f"Mean/product: {_fmt_duration(sum(r.total_elapsed_seconds for r in ok) / len(ok))}")
     print(f"Images:      {sum(r.total_images for r in results)}")
+
+    if blocked:
+        print("\nBlocked by guardrails (not pipeline failures):")
+        for r in blocked:
+            print(f"  [{r.guardrail_blocked_by}] {r.url}")
+            print(f"      {(r.guardrail_reason or '')[:160]}")
 
     if failed:
         print("\nFailures:")
@@ -193,6 +201,13 @@ async def main() -> None:
                         print(
                             f"{prefix}✓ {result.stage_reached} in "
                             f"{_fmt_duration(result.total_elapsed_seconds)}\n",
+                            flush=True,
+                        )
+                    elif result.status == "blocked":
+                        print(
+                            f"{prefix}⛔ blocked at guardrails "
+                            f"({result.guardrail_blocked_by}): "
+                            f"{(result.guardrail_reason or '')[:120]}\n",
                             flush=True,
                         )
                     else:
