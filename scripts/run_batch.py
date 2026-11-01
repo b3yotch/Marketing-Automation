@@ -55,6 +55,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from observability import observability as obs  # noqa: E402
 from app.core.manifest import ManifestWriter, default_manifest_path, read_urls  # noqa: E402
 from app.core.pipeline import (  # noqa: E402
     LANGGRAPH_CHECKPOINT_DB,
@@ -80,11 +81,13 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     print(f"\n{'=' * 70}\nBATCH SUMMARY\n{'=' * 70}")
 
     ok = [r for r in results if r.ok]
-    failed = [r for r in results if not r.ok]
+    blocked = [r for r in results if r.status == "blocked"]
+    failed = [r for r in results if r.status == "failed"]
     not_reached = total_urls - len(results)
 
     print(f"Processed:   {len(results)}/{total_urls}")
     print(f"Succeeded:   {len(ok)}")
+    print(f"Blocked:     {len(blocked)}")
     print(f"Failed:      {len(failed)}")
     if not_reached:
         print(f"Not reached: {not_reached} (interrupted)")
@@ -92,6 +95,12 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     if ok:
         print(f"Mean/product: {_fmt_duration(sum(r.total_elapsed_seconds for r in ok) / len(ok))}")
     print(f"Images:      {sum(r.total_images for r in results)}")
+
+    if blocked:
+        print("\nBlocked by guardrails (not pipeline failures):")
+        for r in blocked:
+            print(f"  [{r.guardrail_blocked_by}] {r.url}")
+            print(f"      {(r.guardrail_reason or '')[:160]}")
 
     if failed:
         print("\nFailures:")
@@ -112,9 +121,10 @@ def _print_summary(results: list[ProductRunResult], total_urls: int, elapsed: fl
     print(f"\nManifest: {out_path}")
     if ok:
         print(
-            "Next: review the selected images, then\n"
+            "Next:\n"
+            f"  python scripts/review.py {out_path}\n"
             "  python scripts/generate_videos.py --from-results "
-            f"{out_path} --rows <n,n,n>"
+            f"{out_path} --approvals <approvals.csv>"
         )
 
 
@@ -157,6 +167,7 @@ async def main() -> None:
     out_path = Path(args.out) if args.out else default_manifest_path(PROJECT_ROOT, "batch")
 
     print(f"{len(urls)} product(s) to process, through stage '{args.stop_after}'.")
+    print(obs.startup_check())
     print(f"Manifest: {out_path}\n")
 
     results: list[ProductRunResult] = []
@@ -180,6 +191,8 @@ async def main() -> None:
                         checkpointer=checkpointer,
                         verbose=args.verbose,
                         prefix=prefix,
+                        run_label="batch",
+                        session_id=out_path.stem,
                     )
 
                     results.append(result)
@@ -189,6 +202,13 @@ async def main() -> None:
                         print(
                             f"{prefix}✓ {result.stage_reached} in "
                             f"{_fmt_duration(result.total_elapsed_seconds)}\n",
+                            flush=True,
+                        )
+                    elif result.status == "blocked":
+                        print(
+                            f"{prefix}⛔ blocked at guardrails "
+                            f"({result.guardrail_blocked_by}): "
+                            f"{(result.guardrail_reason or '')[:120]}\n",
                             flush=True,
                         )
                     else:

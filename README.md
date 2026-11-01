@@ -7,8 +7,8 @@ prompts, on the way to generating marketing images/videos automatically.
 ## Pipeline
 
 ```
-[URL] --> Agent 1: Product Research --> Agent 2: Creative Strategy --> Agent 3: Prompt Generation --> Agent 4: Image Generation (ComfyUI) --> Agent 5: Image Selection (Critic) --> Agent 6: Video Generation (ComfyUI)
-              (done)                          (done)                        (done)                              (done)                                        (done)                                              (done)
+[URL] --> Agent 1: Product Research --> Guardrails (page validity + Llama Guard) --> Agent 2: Creative Strategy --> Agent 3: Prompt Generation --> Agent 4: Image Generation (ComfyUI) --> Agent 5: Image Selection (Critic) --> Agent 6: Video Generation (ComfyUI)
+              (done)                          (gate, not an agent)                          (done)                        (done)                              (done)                                        (done)                                              (done)
 ```
 
 Video generation was originally planned as part of a combined Agent 4
@@ -432,6 +432,12 @@ GROQ_API_KEY=your-key-here
 # Agent 2 - Tavily (cloud, market/competitor research - optional, best-effort)
 TAVILY_API_KEY=your-key-here
 
+# Observability - Langfuse (self-hosted, optional, best-effort). These match
+# the pair defined in langfuse.env; tracing is simply off if they aren't set.
+LANGFUSE_PUBLIC_KEY=pk-lf-local-creative-workflow
+LANGFUSE_SECRET_KEY=sk-lf-local-creative-workflow
+LANGFUSE_BASE_URL=http://localhost:3000
+
 # Agents 4 & 6 - ComfyUI (local)
 COMFYUI_SERVER=http://127.0.0.1:8188
 ```
@@ -626,6 +632,68 @@ buys single-digit-percent speedup for real implementation complexity.
 Sequential isn't the "simple but slow" option here - it's within a few
 percent of the achievable optimum on one machine with one GPU.
 
+### Human-in-the-loop review
+
+`run_batch.py` always stops at Agent 5, and `generate_videos.py` enforces
+a review gate on the one path that could otherwise commit every GPU-hour
+in a batch to Agent 5's judgment with nobody ever looking at a selected
+image (`--from-results <manifest>` with no `--rows`):
+
+```bash
+python scripts/review.py outputs/batch_results_<ts>.csv
+# approve/reject each product, see its below-threshold theme flags
+python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv \
+    --approvals outputs/approvals_<ts>.csv
+```
+
+For each product, `review.py` loads Agent 5's checkpointed selection,
+prints every theme with the path of its chosen image, and **opens the
+below-threshold themes' images in your default viewer** - the ones Agent 5
+itself wasn't confident about, where a human look is worth the most. `v` at
+the prompt opens all of a product's selected images; `--open-all` opens
+everything automatically and `--no-open` opens nothing (e.g. over SSH).
+Re-running on the same manifest resumes: approved/rejected products keep
+their decision and only unreviewed or skipped ones are asked again.
+
+Typing specific row numbers (`--rows`) or specific URLs (positional args,
+`--csv`) already required a person to choose each one, so those paths
+aren't gated further - the approvals file only matters for the "take
+everything that worked" case. `--force` bypasses the gate entirely, for
+when you've decided deliberately not to review.
+
+### Observability (Langfuse)
+
+Optional and best-effort - every pipeline run works identically with no
+Langfuse configured at all, tracing just doesn't happen. When
+`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are set, `run_product()`
+opens one trace per product per command invocation, tagged `batch` or
+`video`, with one span per stage (including whether it was a checkpoint
+hit) and trace-level scores for completion status and selection-flag
+count. The trace id is written into the results manifest, which is what
+lets `scripts/review.py` attach a `human_approval` score to the right
+trace from a separate process invocation - no need to keep the original
+trace object alive across the gap between a batch run and its later
+review.
+
+```bash
+docker compose --env-file langfuse.env -f docker-compose.langfuse.yml up -d
+# UI at http://localhost:3000 - log in with the email/password in langfuse.env
+```
+
+See `Observability.md` for the full architecture, data model, and a
+module-by-module walkthrough.
+
+Written against the Langfuse Python SDK **v5** (`langfuse==5.0.2`), which
+is OpenTelemetry-based: there is no trace object (`TraceHandle` wraps the
+root span), and spans can't be backdated, so each stage opens its span
+before running and closes it after. v5 requires **self-hosted Langfuse
+>= 4.59.0** (or Langfuse Cloud) - v2 and v3 servers are unsupported, which
+is why the compose file is the official six-container stack pinned to the
+`:4` images rather than a minimal Postgres-only one. Each script prints a
+one-line `Tracing: on/off` status at startup (`startup_check()`), because
+best-effort tracing otherwise fails silently on a wrong key or an
+unreachable server.
+
 ## Configuration notes
 
 Settings live in `app/core/config.py`, env-driven, shared across agents.
@@ -640,6 +708,8 @@ Worth understanding rather than just accepting the defaults:
 | `nav_attempt_timeout_ms` | 10000 | Per-strategy navigation timeout, separate from `scrape_timeout_ms`. Without this, a single slow strategy (`networkidle` on a page with persistent background traffic) could burn the entire scrape budget before falling through to a faster fallback strategy. |
 | `review_wait_timeout_ms` | 4000 | How long to wait for a review selector to appear after the scroll-trigger pass, before giving up and calling it `review_extraction_method: "none"`. |
 | `max_extraction_retries` | 2 | Agent 1's retry budget. |
+| `llama_guard_model` | `llama-guard3:1b` (Ollama, local) | The gate between Agents 1 and 2. Must be a Llama Guard checkpoint - its `safe`/`unsafe\nS1,S2` reply contract is parsed natively, not through the project's JSON-schema prompting. |
+| `min_valid_extraction_confidence` | 0.4 | Page-validity half of the same gate: below this self-reported Agent 1 confidence, the product is blocked as `invalid_page` before Llama Guard is even called. |
 | `groq_primary_model` / `groq_fallback_model` | `openai/gpt-oss-120b` / `openai/gpt-oss-20b` | Agent 2's model chain - see `Creative_strategy.md` Challenge 1 for the comparison that produced the primary choice. |
 | `groq_temperature` | 0.7 | Higher than Agent 1's 0.2 - Agent 2 is a creative task, not extraction, so more variance is wanted rather than suppressed. |
 | `max_creative_retries` | 2 | Agent 2's retry budget. |
@@ -662,16 +732,18 @@ Worth understanding rather than just accepting the defaults:
 |---|---|
 | `app/core/config.py` | Env-driven settings for all six agents |
 | `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) |
-| `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5) |
+| `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5, plus the guardrail verdict) |
 | `app/core/langgraph_checkpoint.py` | LangGraph-native resume helper (`run_checkpointed`), used by Agents 4 and 6 |
 | `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; never raises past a stage boundary, returns a `ProductRunResult` instead |
 | `app/core/manifest.py` | `ManifestWriter` (per-row-flushed results CSV) + `read_urls()` (accepts a bare URL or a CSV) |
+| `app/core/observability.py` | Langfuse tracing - one trace/product, one span/stage, no-op if unconfigured |
 | `app/agents/research_agent/schema.py` | `ProductResearch` output contract + `ScrapedProductData` intermediate shape |
 | `app/agents/research_agent/scraper.py` | Playwright fetch + JSON-LD/OG/text extraction, cost-aware review-scroll escalation |
 | `app/agents/research_agent/prompts.py` | System + user prompt for the extraction call |
 | `app/agents/research_agent/state.py` | LangGraph state TypedDict |
 | `app/agents/research_agent/nodes.py` | Node functions + retry/validation routing |
 | `app/agents/research_agent/graph.py` | Graph assembly |
+| `app/agents/research_agent/guardrails.py` | `check_guardrails()` - page-validity heuristic + Llama Guard 3 classification, called by `pipeline.py` between Agents 1 and 2 (not a graph node) |
 | `app/agents/creative_strategy_agent/schema.py` | `CreativeDirection` output contract + `AudienceAngle`/`VisualTheme` sub-models |
 | `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure) |
 | `app/agents/creative_strategy_agent/prompts.py` | System + user prompt for the creative-generation call |
@@ -703,7 +775,9 @@ Worth understanding rather than just accepting the defaults:
 | `scripts/test_pipeline_live.py` | Chains Agent 1 into Agent 2 for two-stage testing |
 | `scripts/test_full_pipeline_live.py` | Chains all six agents for end-to-end testing, with per-stage early-exit flags and checkpointing |
 | `scripts/run_batch.py` | Bulk (or single-URL) entry point - Agents 1-5, always stops before Video Generation, writes the results manifest |
-| `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, prompts for confirmation before starting |
+| `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, enforces the HITL approvals gate on `--from-results` without `--rows` |
+| `scripts/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
+| `docker-compose.langfuse.yml` + `langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values |
 | `main.py` | CLI runner for Agent 1, standalone |
 | `Product_research.md` | Agent 1 design narrative - challenges hit, decisions made, why |
 | `Creative_strategy.md` | Agent 2 design narrative - same format |

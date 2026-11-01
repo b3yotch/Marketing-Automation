@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     ollama_num_ctx: int = 16384
     ollama_num_predict: int = 2048
 
+
+    # guardrails
+    llama_guard_model: str = "llama-guard3:1b"
+    min_valid_extraction_confidence: float = 0.4
+
     # Groq (Creative Strategy Agent)
     groq_api_key: str = ""
     groq_primary_model: str = "openai/gpt-oss-120b"

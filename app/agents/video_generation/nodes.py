@@ -35,8 +35,58 @@ from app.agents.image_selection_agent.schema import ImageSelectionOutput, ThemeS
 from app.agents.video_generation.video_comfyui_client import VideoComfyUIClient, ComfyUIError
 from app.agents.video_generation.schema import GeneratedVideo, ThemeVideoResult, VideoGenerationOutput
 from app.agents.video_generation.state import VideoGenerationState
+from observability import observability as obs
 
 _client = VideoComfyUIClient()
+
+
+def _classify_comfy_error(exc: Exception) -> str:
+    """Observability label for a ComfyUIError, from its message text (the
+    client raises one exception type for everything) - best-effort only,
+    nothing in the pipeline's control flow uses it."""
+    msg = str(exc)
+    if msg.startswith("Timed out"):
+        return "timeout"
+    if msg.startswith("Failed to upload"):
+        return "upload_error"
+    if msg.startswith("Failed to queue") or "rejected the prompt" in msg:
+        return "queue_error"
+    if "no outputs" in msg or "no output files" in msg:
+        return "no_output"
+    if "Configured node id" in msg or "workflow" in msg.lower():
+        return "workflow_config_error"
+    return "comfy_error"
+
+
+def _workflow_facts(template: dict | None) -> dict:
+    """Facts that live inside the exported workflow JSON rather than in
+    Settings (resolution, fps, model precision, offload), read for tracing.
+    Found by class_type, so it does not depend on node ids. Best-effort: {}
+    when the template has a different shape. `resize_keep_proportion=False`
+    is worth watching - it means the source image is stretched to the
+    resize node's fixed width x height."""
+    facts: dict = {}
+    try:
+        for node in (template or {}).values():
+            cls, inputs = node.get("class_type"), node.get("inputs", {})
+            if cls == "ImageResizeKJ":
+                facts.update(
+                    width=inputs.get("width"),
+                    height=inputs.get("height"),
+                    resize_keep_proportion=inputs.get("keep_proportion"),
+                )
+            elif cls == "VHS_VideoCombine":
+                facts["fps"] = inputs.get("frame_rate")
+            elif cls == "DownloadAndLoadCogVideoModel":
+                facts.update(
+                    model=inputs.get("model"),
+                    precision=inputs.get("precision"),
+                    quantization=inputs.get("quantization"),
+                    sequential_cpu_offload=inputs.get("enable_sequential_cpu_offload"),
+                )
+    except Exception:
+        return {}
+    return facts
 
 
 def _current_theme(state: VideoGenerationState):
@@ -138,40 +188,104 @@ def generate_node(state: VideoGenerationState) -> dict:
     # but they're combined here since there's only one text input to feed.
     combined_prompt = f"{theme.video_prompt.base_prompt} {theme.video_prompt.motion_description}"
 
-    # Defensive, not just reactive: clears any job left running from a
-    # prior attempt that timed out client-side (see VideoComfyUIClient.
-    # interrupt's docstring) before spending time trying to talk to a
-    # server that may still be blocked on it. Cheap and a no-op if
-    # ComfyUI is already idle.
-    _client.interrupt()
-
-    start = time.monotonic()
-    try:
-        uploaded_filename = _client.upload_image(source_image_path)
-        workflow = _client.build_video_workflow(
-            state["video_workflow_template"],
-            image_filename=uploaded_filename,
-            positive_prompt=combined_prompt,
-            negative_prompt=theme.video_prompt.negative_prompt,
-            seed=seed,
-            filename_prefix=f"agent6_{theme_index}",
+    facts = _workflow_facts(state.get("video_workflow_template"))
+    frames = settings.comfyui_video_num_frames
+    steps = settings.comfyui_video_steps
+    start = None
+    with obs.comfy_job(
+        kind="video",
+        name="comfyui.video",
+        model=facts.get("model") or "cogvideox-2b-img2vid",
+        input={
+            "prompt": combined_prompt,
+            "negative_prompt": theme.video_prompt.negative_prompt,
+            "source_image": source_image_path,
+        },
+        model_parameters={
+            "num_frames": frames,
+            "steps": steps,
+            "cfg": settings.comfyui_video_cfg,
+            "scheduler": settings.comfyui_video_scheduler,
+            "denoise": settings.comfyui_video_denoise_strength,
+            "width": facts.get("width"),
+            "height": facts.get("height"),
+            "fps": facts.get("fps"),
+            "precision": facts.get("precision"),
+            "quantization": facts.get("quantization"),
+            "sequential_cpu_offload": facts.get("sequential_cpu_offload"),
+            "resize_keep_proportion": facts.get("resize_keep_proportion"),
+        },
+        metadata={
+            "theme_index": theme_index,
+            "attempt": state.get("retries", 0),
+            "seed": seed,
+        },
+        unit="videos",
+        requested=1,
+        steps=steps,
+        frames=frames,
+        width=facts.get("width"),
+        height=facts.get("height"),
+        ollama_host=settings.ollama_host,
+    ) as job:
+        job.set_probes(
+            queue=_client.queue_snapshot,
+            stats=_client.system_stats,
+            history=_client.get_history_entry,
         )
-        prompt_id = _client.queue_prompt(workflow)
-        history_entry = _client.wait_for_completion(prompt_id)
-        raw_outputs = _client.extract_video_outputs(history_entry)
-        if not raw_outputs:
-            raise ComfyUIError("Video job finished but no output files were found.")
+        # Snapshot BEFORE the blanket interrupt below, so a job left running
+        # by an earlier attempt or an interrupted run is visible in the trace.
+        if job.active:
+            job.probe_start()
+            obs.reconcile_abandoned(_client.get_history_entry)
 
-        local_path, filename = _save_video_locally(
-            source_url=state["prompts"].source_url,
-            run_id=state["run_id"],
-            theme_index=theme_index,
-            file_info=raw_outputs[0],  # exactly one video per theme, no batching
-        )
-    except ComfyUIError as exc:
-        return {"error": str(exc), "current_seed": None}
-    except OSError as exc:
-        return {"error": f"Failed saving video locally: {exc}", "current_seed": None}
+        # Defensive, not just reactive: clears any job left running from a
+        # prior attempt that timed out client-side (see VideoComfyUIClient.
+        # interrupt's docstring) before spending time trying to talk to a
+        # server that may still be blocked on it. Cheap and a no-op if
+        # ComfyUI is already idle.
+        _client.interrupt()
+
+        start = time.monotonic()
+        try:
+            job.phase("upload")
+            uploaded_filename = _client.upload_image(source_image_path)
+            workflow = _client.build_video_workflow(
+                state["video_workflow_template"],
+                image_filename=uploaded_filename,
+                positive_prompt=combined_prompt,
+                negative_prompt=theme.video_prompt.negative_prompt,
+                seed=seed,
+                filename_prefix=f"agent6_{theme_index}",
+            )
+            job.phase("queue")
+            prompt_id = _client.queue_prompt(workflow)
+            job.submitted(prompt_id)
+            history_entry = _client.wait_for_completion(prompt_id)
+            job.completed(history_entry)
+            raw_outputs = _client.extract_video_outputs(history_entry)
+            if not raw_outputs:
+                raise ComfyUIError("Video job finished but no output files were found.")
+
+            local_path, filename = _save_video_locally(
+                source_url=state["prompts"].source_url,
+                run_id=state["run_id"],
+                theme_index=theme_index,
+                file_info=raw_outputs[0],  # exactly one video per theme, no batching
+            )
+            job.outputs([filename], 1)
+        except ComfyUIError as exc:
+            outcome = _classify_comfy_error(exc)
+            job.fail(outcome, str(exc), abandoned=(outcome == "timeout"))
+            return {"error": str(exc), "current_seed": None}
+        except OSError as exc:
+            lost_connection = job.current_phase in ("upload", "queue", "wait")
+            job.fail(
+                "connection_error" if lost_connection else "save_error",
+                f"{type(exc).__name__}: {exc}",
+                abandoned=(job.current_phase == "wait"),
+            )
+            return {"error": f"Failed saving video locally: {exc}", "current_seed": None}
 
     elapsed = time.monotonic() - start
 
@@ -244,6 +358,7 @@ def advance_theme_node(state: VideoGenerationState) -> dict:
 
 
 def finalize_node(state: VideoGenerationState) -> dict:
+    obs.reconcile_abandoned(_client.get_history_entry)  # observability only; no-op when untraced
     output = VideoGenerationOutput(
         source_url=state["prompts"].source_url,
         theme_results=state.get("completed_theme_results", []),

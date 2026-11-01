@@ -12,6 +12,12 @@ never block creative generation. If a search errors out, times out, or no
 API key is set, the agent proceeds without market context rather than
 failing the whole pipeline over an enrichment step that was never a hard
 requirement.
+
+Each search is also recorded as a Langfuse tool span under the running
+stage (see observability/observability.py). That keeps the best-effort contract
+intact while ending the invisibility that contract used to imply: a search
+that fails is still swallowed and still returns "", but it now shows up as
+an ERROR span carrying the exception, instead of leaving no trace at all.
 """
 
 from __future__ import annotations
@@ -20,15 +26,43 @@ import asyncio
 
 from tavily import AsyncTavilyClient
 
+from observability import observability as obs
 from app.core.config import settings
 from app.agents.research_agent.schema import ProductResearch
 
 
-async def _safe_search(client: AsyncTavilyClient, *, query: str, **kwargs) -> str:
+async def _safe_search(client: AsyncTavilyClient, *, query: str, tag: str, **kwargs) -> str:
     """Run one Tavily search, returning its synthesized answer or '' on any failure."""
+    # Tavily bills basic searches at 1 credit and advanced at 2 (this
+    # project's own accounting: one trend + one advanced competitor search
+    # = 3 credits per run). An estimate from the request, not a reading from
+    # the response.
+    depth = kwargs.get("search_depth", "basic")
     try:
-        response = await client.search(query=query, include_answer=True, **kwargs)
-        return response.get("answer") or ""
+        # The span sits INSIDE the try on purpose: an exception has to pass
+        # through the `with` for the span to record it as an error, and only
+        # then reach the handler below that swallows it.
+        with obs.tool_span(
+            name=f"tavily:{tag}",
+            input={"query": query, **kwargs},
+            metadata={"search_depth": depth, "estimated_credits": 2 if depth == "advanced" else 1},
+        ) as span:
+            response = await client.search(query=query, include_answer=True, **kwargs)
+            answer = response.get("answer") or ""
+            results = response.get("results") or []
+            # The synthesized answer is exactly what gets folded into the
+            # creative prompt, so it's worth seeing. Result bodies are not
+            # recorded - they can carry competitors' verbatim ad copy, and
+            # the URLs are enough to trace where an answer came from.
+            span.record(
+                output={
+                    "answer": answer,
+                    "n_results": len(results),
+                    "urls": [r.get("url") for r in results if isinstance(r, dict)],
+                },
+                metadata={"empty_answer": not answer},
+            )
+            return answer
     except Exception:  # noqa: BLE001 - enrichment is best-effort, never break the pipeline over this
         return ""
 
@@ -60,8 +94,8 @@ async def fetch_market_context(research: ProductResearch) -> str:
     )
 
     trend_answer, competitor_answer = await asyncio.gather(
-        _safe_search(client, query=trend_query, topic="news", max_results=5),
-        _safe_search(client, query=competitor_query, search_depth="advanced", max_results=5),
+        _safe_search(client, query=trend_query, tag="trend", topic="news", max_results=5),
+        _safe_search(client, query=competitor_query, tag="competitor", search_depth="advanced", max_results=5),
     )
 
     parts: list[str] = []

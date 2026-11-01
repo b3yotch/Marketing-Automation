@@ -39,8 +39,24 @@ from app.agents.image_generation.schema import (
     ThemeGenerationResult,
 )
 from app.agents.image_generation.state import ImageGenerationState
+from observability import observability as obs
 
 _client = ComfyUIClient()
+
+
+def _classify_comfy_error(exc: Exception) -> str:
+    """Observability label for a ComfyUIError. Derived from the message text
+    (the client raises one exception type for everything), so it is a
+    best-effort label only - nothing in the pipeline's control flow uses it.
+    Unrecognised messages fall into 'comfy_error'."""
+    msg = str(exc)
+    if msg.startswith("Timed out"):
+        return "timeout"
+    if msg.startswith("Failed to queue") or "rejected the prompt" in msg:
+        return "queue_error"
+    if "no image output" in msg:
+        return "no_output"
+    return "comfy_error"
 
 
 def _current_theme(state: ImageGenerationState):
@@ -126,31 +142,89 @@ def generate_node(state: ImageGenerationState) -> dict:
         filename_prefix=f"agent4_{theme_index}",
     )
 
-    start = time.monotonic()
-    try:
-        prompt_id = _client.queue_prompt(workflow)
-        history_entry = _client.wait_for_completion(prompt_id)
-        raw_images = _client.extract_images(history_entry)
-        saved_images = _save_images_locally(
-            source_url=state["prompts"].source_url,
-            run_id=state["run_id"],
-            theme_index=theme_index,
-            images=raw_images,
-            width=width,
-            height=height,
-            seed=seed,
+    steps = settings.comfyui_steps
+    start = None
+    with obs.comfy_job(
+        kind="image",
+        name="comfyui.image_batch",
+        model=settings.comfyui_checkpoint,
+        input={
+            "positive_prompt": theme.image_prompt.positive_prompt,
+            "negative_prompt": theme.image_prompt.negative_prompt,
+        },
+        model_parameters={
+            "steps": steps,
+            "cfg": settings.comfyui_cfg,
+            "sampler": settings.comfyui_sampler,
+            "scheduler": settings.comfyui_scheduler,
+            "width": width,
+            "height": height,
+            "batch_size": batch_size,
+            "denoise": 1.0,
+        },
+        metadata={
+            "theme_index": theme_index,
+            "attempt": state.get("retries", 0),
+            "seed": seed,
+            "aspect_ratio": theme.image_prompt.aspect_ratio,
+        },
+        unit="images",
+        requested=batch_size,
+        steps=steps,
+        width=width,
+        height=height,
+        ollama_host=settings.ollama_host,
+    ) as job:
+        job.set_probes(
+            queue=_client.queue_snapshot,
+            stats=_client.system_stats,
+            history=_client.get_history_entry,
         )
-    except ComfyUIError as exc:
-        # Caught here (not left to propagate) so validate_node has a
-        # concrete error to act on immediately - same "write the failure
-        # reason the moment it happens" pattern as Agents 1-3's
-        # validate_node, not deferred until retries are exhausted.
-        return {"error": str(exc), "current_seed": None}
-    except OSError as exc:
-        # Local disk write failure (permissions, disk full) - distinct from
-        # a ComfyUI-side failure, but still needs to fail this attempt and
-        # retry, since a partially-saved theme isn't usable.
-        return {"error": f"Failed saving images locally: {exc}", "current_seed": None}
+        try:
+            if job.active:
+                job.probe_start()
+                obs.reconcile_abandoned(_client.get_history_entry)
+            start = time.monotonic()
+            job.phase("queue")
+            prompt_id = _client.queue_prompt(workflow)
+            job.submitted(prompt_id)
+            history_entry = _client.wait_for_completion(prompt_id)
+            job.completed(history_entry)
+            raw_images = _client.extract_images(history_entry)
+            saved_images = _save_images_locally(
+                source_url=state["prompts"].source_url,
+                run_id=state["run_id"],
+                theme_index=theme_index,
+                images=raw_images,
+                width=width,
+                height=height,
+                seed=seed,
+            )
+            job.outputs([img.filename for img in saved_images], len(saved_images))
+            if len(saved_images) != batch_size:
+                job.unusable("count_mismatch")  # validate_node will reject it; count the GPU time as waste
+        except ComfyUIError as exc:
+            # Caught here (not left to propagate) so validate_node has a
+            # concrete error to act on immediately - same "write the failure
+            # reason the moment it happens" pattern as Agents 1-3's
+            # validate_node, not deferred until retries are exhausted.
+            outcome = _classify_comfy_error(exc)
+            job.fail(outcome, str(exc), abandoned=(outcome == "timeout"))
+            return {"error": str(exc), "current_seed": None}
+        except OSError as exc:
+            # Local disk write failure (permissions, disk full) - distinct from
+            # a ComfyUI-side failure, but still needs to fail this attempt and
+            # retry, since a partially-saved theme isn't usable.
+            # (Observability only: a requests exception during queue/wait also
+            # lands here because requests' errors subclass OSError, so the
+            # phase decides whether it is reported as a lost connection.)
+            lost_connection = job.current_phase in ("queue", "wait")
+            job.fail(
+                "connection_error" if lost_connection else "save_error",
+                f"{type(exc).__name__}: {exc}",
+                abandoned=(job.current_phase == "wait"),
+            )
+            return {"error": f"Failed saving images locally: {exc}", "current_seed": None}
 
     elapsed = time.monotonic() - start
 
@@ -208,6 +282,7 @@ def advance_theme_node(state: ImageGenerationState) -> dict:
 
 
 def finalize_node(state: ImageGenerationState) -> dict:
+    obs.reconcile_abandoned(_client.get_history_entry)  # observability only; no-op when untraced
     output = ImageGenerationOutput(
         source_url=state["prompts"].source_url,
         theme_results=state.get("completed_theme_results", []),

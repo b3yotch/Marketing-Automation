@@ -30,15 +30,20 @@ from app.core.pipeline import ProductRunResult
 
 COLUMNS = [
     "url",
-    "status",           # ok | failed
+    "status",           # ok | failed | blocked (failed a guardrail)
     "stage_reached",    # last stage that completed
-    "error",            # populated only on failure
+    "error",            # populated only on failure/block
+    "guardrail",        # invalid_page | unsafe | guard_error; blank when not blocked
+    "guardrail_reason", # human-readable verdict from Llama Guard / page validity
     "themes_completed", # "2/3"
     "total_images",
     "selection_flags",  # themes that came back selected_below_threshold
     "videos_generated", # blank when video was never attempted
     "elapsed_seconds",
     "finished_at",      # UTC, so a long batch's row ordering is auditable
+    "trace_id",         # Langfuse trace id - blank when tracing isn't configured;
+                         # scripts/review.py uses this to attach the HITL decision
+                         # to the right trace without needing the original object
 ]
 
 
@@ -74,6 +79,8 @@ class ManifestWriter:
                 "status": result.status,
                 "stage_reached": result.failed_stage or result.stage_reached,
                 "error": (result.error or "").replace("\n", " ")[:500],
+                "guardrail": result.guardrail_blocked_by or "",
+                "guardrail_reason": (result.guardrail_reason or "").replace("\n", " ")[:300],
                 "themes_completed": result.themes_fraction,
                 "total_images": result.total_images,
                 # "; " not "," so the field stays readable even though the
@@ -84,9 +91,17 @@ class ManifestWriter:
                 ),
                 "elapsed_seconds": f"{result.total_elapsed_seconds:.1f}",
                 "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "trace_id": result.trace_id or "",
             }
         )
         self._fh.flush()
+
+
+def read_manifest_rows(path: Path) -> list[dict]:
+    """Shared by generate_videos.py and scripts/review.py - both need the
+    same 'open a results manifest as plain dicts' operation."""
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
 
 
 def default_manifest_path(project_root: Path, kind: str) -> Path:

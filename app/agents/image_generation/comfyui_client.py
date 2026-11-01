@@ -183,3 +183,57 @@ class ComfyUIClient:
             for image in node_output.get("images", []):
                 images.append({"filename": image["filename"], "subfolder": image.get("subfolder", "")})
         return images
+
+    # ------------------------------------------------------------------
+    # Read-only probes used by observability. Each one is best-effort:
+    # short timeout, returns None on ANY failure, never raises - so a busy
+    # or unreachable ComfyUI can cost a trace some detail, never a run.
+    # They are only called when a job is actually being traced.
+    # ------------------------------------------------------------------
+
+    def queue_snapshot(self, timeout: float = 2.0) -> dict | None:
+        """What ComfyUI has running/pending right now (GET /queue)."""
+        try:
+            r = requests.get(f"{self.server}/queue", timeout=timeout)
+            r.raise_for_status()
+            body = r.json()
+            running = body.get("queue_running") or []
+            pending = body.get("queue_pending") or []
+            ids = [item[1] for item in running if isinstance(item, (list, tuple)) and len(item) > 1]
+            return {"running": len(running), "pending": len(pending), "running_ids": ids}
+        except Exception:
+            return None
+
+    def system_stats(self, timeout: float = 2.0) -> dict | None:
+        """ComfyUI's own view of RAM/VRAM (GET /system_stats), in MiB."""
+        try:
+            r = requests.get(f"{self.server}/system_stats", timeout=timeout)
+            r.raise_for_status()
+            body = r.json()
+            system = body.get("system") or {}
+            device = (body.get("devices") or [{}])[0]
+
+            def mib(value):
+                return round(value / 1048576) if isinstance(value, (int, float)) else None
+
+            return {
+                "comfyui_version": system.get("comfyui_version"),
+                "device": device.get("name"),
+                "ram_free_mib": mib(system.get("ram_free")),
+                "ram_total_mib": mib(system.get("ram_total")),
+                "vram_free_mib": mib(device.get("vram_free")),
+                "torch_vram_total_mib": mib(device.get("torch_vram_total")),
+                "torch_vram_free_mib": mib(device.get("torch_vram_free")),
+            }
+        except Exception:
+            return None
+
+    def get_history_entry(self, prompt_id: str, timeout: float = 5.0) -> dict | None:
+        """One job's /history entry, or None if absent (still queued or
+        running) or unreachable."""
+        try:
+            r = requests.get(f"{self.server}/history/{prompt_id}", timeout=timeout)
+            r.raise_for_status()
+            return r.json().get(prompt_id)
+        except Exception:
+            return None

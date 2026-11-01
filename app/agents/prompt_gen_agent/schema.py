@@ -97,6 +97,10 @@ class ThemePromptSet(BaseModel):
     actual unit of output. One of these per visual_theme, not per hook: hooks
     and captions are text copy meant to pair with a visual, not each drive
     their own separate generation.
+
+    This is also the schema handed to the model directly - one call per
+    theme, so a theme can't be silently merged into or dropped in favor of
+    another. The caller assembles PromptGenerationOutput from the results.
     """
 
     source_setting: str = Field(
@@ -121,6 +125,15 @@ class ThemePromptSet(BaseModel):
             "that pair well with this visual - do not invent new caption text here."
         ),
     )
+    extraction_confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Self-reported confidence 0-1 that this theme's prompts are grounded "
+            "in the visual_theme/hooks/captions provided, not invented from scratch."
+        ),
+    )
 
 
 class PromptGenerationOutput(BaseModel):
@@ -138,7 +151,8 @@ class PromptGenerationOutput(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Self-reported confidence 0-1 that these prompts are grounded in "
-            "the input visual_themes/hooks/captions, not invented from scratch."
+            "Lowest per-theme extraction_confidence across prompt_sets - "
+            "computed in code from each theme's own self-report, not asked "
+            "of the model separately."
         ),
     )

@@ -24,6 +24,7 @@ import ollama
 from groq import AsyncGroq, RateLimitError
 from pydantic import BaseModel
 
+from observability import observability as obs
 from app.core.config import settings
 
 T = TypeVar("T", bound=BaseModel)
@@ -44,6 +45,87 @@ class LLMRateLimitError(LLMExtractionError):
     instead of retrying instantly. See structured_chat_groq_vision's
     docstring.
     """
+
+
+# ---------------------------------------------------------------------------
+# Tracing helpers (Langfuse). Provider-specific parsing lives here, next to
+# the calls it describes; observability/observability.py stays provider-agnostic.
+# Everything below degrades to {} / None on an unexpected response shape -
+# telemetry must never be the reason a model call fails.
+# ---------------------------------------------------------------------------
+
+
+def _field(obj, key):
+    """ollama's ChatResponse is attribute- AND subscript-accessible; groq's
+    objects are attribute-only. Try both, never raise."""
+    value = getattr(obj, key, None)
+    if value is None:
+        try:
+            value = obj[key]
+        except Exception:  # noqa: BLE001
+            value = None
+    return value
+
+
+def _ollama_telemetry(response) -> tuple[dict, dict, str | None]:
+    """(usage, metadata, done_reason). Durations arrive in nanoseconds.
+    `load_s` well above zero means the model was (re)loaded for this call -
+    a swap-in, which is what a shared 6GB GPU makes expensive."""
+    prompt_tokens = _field(response, "prompt_eval_count")
+    output_tokens = _field(response, "eval_count")
+    usage = {}
+    if isinstance(prompt_tokens, int):
+        usage["input"] = prompt_tokens
+    if isinstance(output_tokens, int):
+        usage["output"] = output_tokens
+    if usage:
+        usage["total"] = sum(usage.values())
+
+    def seconds(key):
+        value = _field(response, key)
+        return round(value / 1e9, 2) if isinstance(value, (int, float)) else None
+
+    eval_s = seconds("eval_duration")
+    done_reason = _field(response, "done_reason")
+    meta = {
+        "done_reason": done_reason,
+        "total_s": seconds("total_duration"),
+        "load_s": seconds("load_duration"),
+        "prompt_eval_s": seconds("prompt_eval_duration"),
+        "eval_s": eval_s,
+    }
+    if isinstance(output_tokens, int) and eval_s:
+        meta["tokens_per_second"] = round(output_tokens / eval_s, 1)
+    return usage, {k: v for k, v in meta.items() if v is not None}, done_reason
+
+
+def _groq_telemetry(response) -> tuple[dict, dict, str | None]:
+    """(usage, metadata, finish_reason). `finish_reason == "length"` means
+    the output hit max_tokens - the usual cause of truncated, unparseable
+    JSON, so it's surfaced as a warning on the span."""
+    usage = {}
+    meta: dict = {}
+    raw_usage = getattr(response, "usage", None)
+    if raw_usage is not None:
+        for ours, theirs in (("input", "prompt_tokens"), ("output", "completion_tokens"), ("total", "total_tokens")):
+            value = getattr(raw_usage, theirs, None)
+            if isinstance(value, int):
+                usage[ours] = value
+        for ours, theirs in (
+            ("queue_time_s", "queue_time"),
+            ("prompt_time_s", "prompt_time"),
+            ("completion_time_s", "completion_time"),
+            ("total_time_s", "total_time"),
+        ):
+            value = getattr(raw_usage, theirs, None)
+            if isinstance(value, (int, float)):
+                meta[ours] = round(float(value), 3)
+    choices = getattr(response, "choices", None) or []
+    finish = getattr(choices[0], "finish_reason", None) if choices else None
+    meta["finish_reason"] = finish
+    meta["response_model"] = getattr(response, "model", None)
+    return usage, {k: v for k, v in meta.items() if v is not None}, finish
+
 
 
 def _strip_code_fences(text: str) -> str:
@@ -214,37 +296,63 @@ async def structured_chat(
         f"{_build_example_json(schema)}"
     )
 
-    response = await client.chat(
+    messages = [
+        {"role": "system", "content": system_prompt + schema_hint},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    with obs.generation(
+        name=f"ollama:{schema.__name__}",
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt + schema_hint},
-            {"role": "user", "content": user_prompt},
-        ],
-        think=False,
-        keep_alive="30m",
-        options={
+        provider="ollama",
+        input=messages,
+        model_parameters={
             "temperature": temperature,
             "num_ctx": settings.ollama_num_ctx,
             "num_predict": settings.ollama_num_predict,
+            "keep_alive": "30m",
+            "think": False,
         },
-    )
+    ) as gen:
+        response = await client.chat(
+            model=model,
+            messages=messages,
+            think=False,
+            keep_alive="30m",
+            options={
+                "temperature": temperature,
+                "num_ctx": settings.ollama_num_ctx,
+                "num_predict": settings.ollama_num_predict,
+            },
+        )
 
-    raw_content = response["message"]["content"] or ""
+        usage, meta, done_reason = _ollama_telemetry(response)
+        if gen.active:
+            meta.update(await obs.ollama_memory(settings.ollama_host, model))
 
-    if not raw_content.strip():
-        # Some Ollama versions still leak the answer into the thinking field
-        # even with think=False, depending on the model's chat template.
-        raw_content = response["message"].get("thinking") or ""
+        raw_content = response["message"]["content"] or ""
 
-    json_text = _extract_json_object(raw_content)
+        if not raw_content.strip():
+            # Some Ollama versions still leak the answer into the thinking field
+            # even with think=False, depending on the model's chat template.
+            raw_content = response["message"].get("thinking") or ""
 
-    try:
-        parsed = json.loads(json_text)
-        return schema.model_validate(parsed)
-    except Exception as exc:  # noqa: BLE001 - we want to wrap any parse/validation error
-        raise LLMExtractionError(
-            f"Model output failed schema validation: {exc}\nRaw output: {raw_content[:500]!r}"
-        ) from exc
+        gen.record(
+            output=raw_content,
+            usage=usage,
+            metadata=meta,
+            warning="done_reason=length: output hit num_predict" if done_reason == "length" else None,
+        )
+
+        json_text = _extract_json_object(raw_content)
+
+        try:
+            parsed = json.loads(json_text)
+            return schema.model_validate(parsed)
+        except Exception as exc:  # noqa: BLE001 - we want to wrap any parse/validation error
+            raise LLMExtractionError(
+                f"Model output failed schema validation: {exc}\nRaw output: {raw_content[:500]!r}"
+            ) from exc
 
 
 async def structured_chat_vision(
@@ -295,37 +403,64 @@ async def structured_chat_vision(
         f"{_build_example_json(schema)}"
     )
 
-    response = await client.chat(
+    messages = [
+        {"role": "system", "content": system_prompt + schema_hint},
+        {"role": "user", "content": user_prompt, "images": image_paths},
+    ]
+
+    with obs.generation(
+        name=f"ollama:{schema.__name__}",
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt + schema_hint},
-            {"role": "user", "content": user_prompt, "images": image_paths},
-        ],
-        think=False,
-        keep_alive="30m",
-        options={
+        provider="ollama",
+        input=messages,
+        model_parameters={
             "temperature": temperature,
             "num_ctx": settings.ollama_num_ctx,
             "num_predict": num_predict or settings.ollama_num_predict,
+            "keep_alive": "30m",
+            "think": False,
         },
-    )
+        metadata={"n_images": len(image_paths), "images": [Path(p).name for p in image_paths]},
+    ) as gen:
+        response = await client.chat(
+            model=model,
+            messages=messages,
+            think=False,
+            keep_alive="30m",
+            options={
+                "temperature": temperature,
+                "num_ctx": settings.ollama_num_ctx,
+                "num_predict": num_predict or settings.ollama_num_predict,
+            },
+        )
 
-    raw_content = response["message"]["content"] or ""
+        usage, meta, done_reason = _ollama_telemetry(response)
+        if gen.active:
+            meta.update(await obs.ollama_memory(settings.ollama_host, model))
 
-    if not raw_content.strip():
-        # Same leak-into-thinking-field behavior as structured_chat, even
-        # with think=False - see that function's docstring.
-        raw_content = response["message"].get("thinking") or ""
+        raw_content = response["message"]["content"] or ""
 
-    json_text = _extract_json_object(raw_content)
+        if not raw_content.strip():
+            # Same leak-into-thinking-field behavior as structured_chat, even
+            # with think=False - see that function's docstring.
+            raw_content = response["message"].get("thinking") or ""
 
-    try:
-        parsed = json.loads(json_text)
-        return schema.model_validate(parsed)
-    except Exception as exc:  # noqa: BLE001 - we want to wrap any parse/validation error
-        raise LLMExtractionError(
-            f"Model output failed schema validation: {exc}\nRaw output: {raw_content[:500]!r}"
-        ) from exc
+        gen.record(
+            output=raw_content,
+            usage=usage,
+            metadata=meta,
+            warning="done_reason=length: output hit num_predict" if done_reason == "length" else None,
+        )
+
+        json_text = _extract_json_object(raw_content)
+
+        try:
+            parsed = json.loads(json_text)
+            return schema.model_validate(parsed)
+        except Exception as exc:  # noqa: BLE001 - we want to wrap any parse/validation error
+            raise LLMExtractionError(
+                f"Model output failed schema validation: {exc}\nRaw output: {raw_content[:500]!r}"
+            ) from exc
 
 
 async def structured_chat_groq(
@@ -351,35 +486,52 @@ async def structured_chat_groq(
     """
     client = AsyncGroq(api_key=settings.groq_api_key)
 
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=temperature,
-            max_tokens=settings.groq_max_tokens,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema.__name__,
-                    "schema": schema.model_json_schema(),
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    with obs.generation(
+        name=f"groq:{schema.__name__}",
+        model=model,
+        provider="groq",
+        input=messages,
+        model_parameters={"temperature": temperature, "max_tokens": settings.groq_max_tokens},
+    ) as gen:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=settings.groq_max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.__name__,
+                        "schema": schema.model_json_schema(),
+                    },
                 },
-            },
+            )
+        except Exception as exc:  # noqa: BLE001 - network/API errors also need to trigger fallback in nodes.py
+            raise LLMExtractionError(f"Groq API call failed for model {model!r}: {exc}") from exc
+
+        raw_content = response.choices[0].message.content or ""
+
+        usage, meta, finish_reason = _groq_telemetry(response)
+        gen.record(
+            output=raw_content,
+            usage=usage,
+            metadata=meta,
+            warning="finish_reason=length: output hit max_tokens" if finish_reason == "length" else None,
         )
-    except Exception as exc:  # noqa: BLE001 - network/API errors also need to trigger fallback in nodes.py
-        raise LLMExtractionError(f"Groq API call failed for model {model!r}: {exc}") from exc
 
-    raw_content = response.choices[0].message.content or ""
-
-    try:
-        parsed = json.loads(raw_content)
-        return schema.model_validate(parsed)
-    except Exception as exc:  # noqa: BLE001
-        raise LLMExtractionError(
-            f"Groq output failed schema validation for model {model!r}: {exc}\nRaw output: {raw_content[:500]!r}"
-        ) from exc
+        try:
+            parsed = json.loads(raw_content)
+            return schema.model_validate(parsed)
+        except Exception as exc:  # noqa: BLE001
+            raise LLMExtractionError(
+                f"Groq output failed schema validation for model {model!r}: {exc}\nRaw output: {raw_content[:500]!r}"
+            ) from exc
 
 
 async def structured_chat_groq_vision(
@@ -423,37 +575,61 @@ async def structured_chat_groq_vision(
             }
         )
 
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema.__name__,
-                    "schema": schema.model_json_schema(),
+    # Trace input is the text only. `content` above carries every image as a
+    # base64 data URI - megabytes per call - which must never be shipped to
+    # the trace; the image names go in metadata instead.
+    traced_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    with obs.generation(
+        name=f"groq:{schema.__name__}",
+        model=model,
+        provider="groq",
+        input=traced_messages,
+        model_parameters={"temperature": temperature, "max_tokens": max_tokens},
+        metadata={"n_images": len(image_paths), "images": [Path(p).name for p in image_paths]},
+    ) as gen:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.__name__,
+                        "schema": schema.model_json_schema(),
+                    },
                 },
-            },
+            )
+        except RateLimitError as exc:
+            # Caught separately from the generic Exception branch below - see
+            # LLMRateLimitError's docstring for why this needs to be
+            # distinguishable to callers, not just another LLMExtractionError.
+            raise LLMRateLimitError(f"Groq vision API rate limit hit for model {model!r}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - network/API errors also need to trigger fallback in nodes.py
+            raise LLMExtractionError(f"Groq vision API call failed for model {model!r}: {exc}") from exc
+
+        raw_content = response.choices[0].message.content or ""
+
+        usage, meta, finish_reason = _groq_telemetry(response)
+        gen.record(
+            output=raw_content,
+            usage=usage,
+            metadata=meta,
+            warning="finish_reason=length: output hit max_tokens" if finish_reason == "length" else None,
         )
-    except RateLimitError as exc:
-        # Caught separately from the generic Exception branch below - see
-        # LLMRateLimitError's docstring for why this needs to be
-        # distinguishable to callers, not just another LLMExtractionError.
-        raise LLMRateLimitError(f"Groq vision API rate limit hit for model {model!r}: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - network/API errors also need to trigger fallback in nodes.py
-        raise LLMExtractionError(f"Groq vision API call failed for model {model!r}: {exc}") from exc
 
-    raw_content = response.choices[0].message.content or ""
-
-    try:
-        parsed = json.loads(raw_content)
-        return schema.model_validate(parsed)
-    except Exception as exc:  # noqa: BLE001
-        raise LLMExtractionError(
-            f"Groq vision output failed schema validation for model {model!r}: {exc}\nRaw output: {raw_content[:500]!r}"
-        ) from exc
+        try:
+            parsed = json.loads(raw_content)
+            return schema.model_validate(parsed)
+        except Exception as exc:  # noqa: BLE001
+            raise LLMExtractionError(
+                f"Groq vision output failed schema validation for model {model!r}: {exc}\nRaw output: {raw_content[:500]!r}"
+            ) from exc
