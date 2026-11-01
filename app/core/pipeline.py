@@ -54,6 +54,7 @@ close it on the way out) and is what a single-URL caller should do.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -93,6 +94,7 @@ ALLOWED_MSGPACK_MODULES = [
     ("app.agents.image_generation.schema", "ThemeGenerationResult"),
     ("app.agents.image_generation.schema", "ImageGenerationOutput"),
     ("app.agents.image_selection_agent.schema", "ImageSelectionOutput"),
+    ("app.agents.video_generation.schema", "ThemeVideoResult"),
     ("app.agents.video_generation.schema", "VideoGenerationOutput"),
 ]
 
@@ -158,6 +160,7 @@ class ProductRunResult:
     total_images: int = 0
     selection_flags: list[str] = field(default_factory=list)
     videos_generated: int | None = None
+    images_kept: int | None = None  # themes with a selected image (Agent 5) - observability only
 
     research: Any = None
     creative: Any = None
@@ -204,6 +207,7 @@ def _fail(result: ProductRunResult, stage: str, error: Any, t_start: float, trac
         status="failed",
         stage_reached=stage,
         selection_flag_count=len(result.selection_flags),
+        images_kept=result.images_kept,
     )
     obs.flush()
     return result
@@ -216,6 +220,7 @@ def _finish(result: ProductRunResult, t_start: float, trace: Any = None) -> Prod
         status="ok",
         stage_reached=result.stage_reached,
         selection_flag_count=len(result.selection_flags),
+        images_kept=result.images_kept,
     )
     obs.flush()
     return result
@@ -240,6 +245,7 @@ async def run_product(
     verbose: bool = False,
     prefix: str = "",
     run_label: str = "batch",
+    session_id: str | None = None,
 ) -> ProductRunResult:
     """
     Runs stages 1..`stop_after` for one URL and returns what happened.
@@ -249,7 +255,8 @@ async def run_product(
     batch can tag output with '[12/50] '. `run_label` ("batch" | "video")
     tags the Langfuse trace so the two commands' runs are distinguishable
     in Langfuse's UI/filters - it has no effect when tracing isn't
-    configured.
+    configured. `session_id` groups the traces of one command invocation
+    into a Langfuse session (the scripts pass the manifest's file stem).
     """
     if stop_after not in STAGE_ORDER:
         raise ValueError(f"stop_after must be one of {STAGE_ORDER}, got {stop_after!r}")
@@ -262,7 +269,7 @@ async def run_product(
     # reference it even if something fails before a single stage runs -
     # obs.start_trace() never raises (it catches internally), so this
     # assignment itself can't be the thing that fails.
-    trace = obs.start_trace(url, run_label)
+    trace = obs.start_trace(url, run_label, session_id=session_id, product=slugify_url(url))
     result.trace_id = obs.trace_id(trace)
 
     def log(msg: str) -> None:
@@ -536,6 +543,7 @@ async def run_product(
                 for th in selection.theme_results
                 if th.status == "selected_below_threshold"
             ]
+            result.images_kept = sum(1 for th in selection.theme_results if th.selected_local_path)
             if result.selection_flags:
                 log(f"  ⚠ {len(result.selection_flags)} theme(s) selected below threshold")
             dump(selection)
@@ -581,6 +589,13 @@ async def run_product(
             dump(videos)
             return _finish(result, t_start, trace)
 
+    except asyncio.CancelledError:
+        # Ctrl-C reaches here as a cancel, which `except Exception` does not
+        # catch. Close the trace so the interrupted stage (and its finished
+        # ComfyUI jobs) are exported instead of silently lost, then let the
+        # cancel continue exactly as before.
+        obs.abort_trace(trace, "interrupted")
+        raise
     except Exception as exc:
         # Backstop for anything outside a stage guard (checkpointer setup,
         # a checkpoint file that won't deserialize, disk full mid-save).

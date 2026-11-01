@@ -192,6 +192,7 @@ async def main() -> None:
                         verbose=args.verbose,
                         prefix=prefix,
                         run_label="batch",
+                        session_id=out_path.stem,
                     )
 
                     results.append(result)

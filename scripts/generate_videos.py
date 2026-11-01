@@ -312,6 +312,7 @@ async def main() -> None:
                         verbose=args.verbose,
                         prefix=prefix,
                         run_label="video",
+                        session_id=out_path.stem,
                     )
 
                     results.append(result)

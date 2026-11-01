@@ -63,9 +63,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 try:
     from langfuse import Langfuse, propagate_attributes
@@ -334,9 +335,10 @@ def _sample_interval() -> float:
 class _OpenStage:
     """A stage span that is currently running, plus its resource sampler."""
 
-    def __init__(self, span: Any, sampler: _Sampler | None):
+    def __init__(self, span: Any, sampler: _Sampler | None, usage: Any = None):
         self.span = span
         self.sampler = sampler
+        self.usage = usage  # StageUsage: ComfyUI jobs run inside this stage
 
 
 
@@ -352,13 +354,24 @@ class TraceHandle:
         self.root = root
         self.trace_id: str = root.trace_id
         self.open_spans: dict[str, Any] = {}
+        self.usage_by_stage: dict[str, dict] = {}
 
 
-def start_trace(url: str, run_label: str) -> Optional[TraceHandle]:
+def start_trace(
+    url: str,
+    run_label: str,
+    session_id: str | None = None,
+    product: str | None = None,
+) -> Optional[TraceHandle]:
     """
     One trace per product per command invocation. `run_label` ("batch" |
     "video") becomes a tag and part of the trace name so the two commands'
     runs are filterable in the UI.
+
+    `session_id` groups every product of one command invocation into a
+    Langfuse *session* (the scripts pass the manifest's file stem, so a
+    batch in Langfuse and its results CSV share a name); `product` is the
+    URL slug, stored as trace metadata so traces can be filtered per product.
 
     `propagate_attributes` must wrap the root span's creation for the tags
     and name to land on the trace - it only affects spans created inside
@@ -369,11 +382,13 @@ def start_trace(url: str, run_label: str) -> Optional[TraceHandle]:
         return None
     try:
         name = f"product:{run_label}"
-        with propagate_attributes(
-            trace_name=name,
-            tags=[run_label],
-            metadata={"run_label": run_label},
-        ):
+        trace_meta = {"run_label": run_label}
+        if product:
+            trace_meta["product"] = product[:200]
+        attrs: dict[str, Any] = {"trace_name": name, "tags": [run_label], "metadata": trace_meta}
+        if session_id:
+            attrs["session_id"] = session_id[:200]
+        with propagate_attributes(**attrs):
             root = client.start_observation(name=name, as_type="span", input={"url": url})
         return TraceHandle(root)
     except Exception as exc:
@@ -399,8 +414,10 @@ def begin_stage(trace: Optional[TraceHandle], stage: str, **input_data: Any) -> 
         if _sampling_enabled():
             sampler = _Sampler(_sample_interval())
             sampler.start()
-        trace.open_spans[stage] = _OpenStage(span, sampler)
+        usage = StageUsage()
+        trace.open_spans[stage] = _OpenStage(span, sampler, usage)
         _active_parent.set(span)
+        _active_usage.set(usage)
     except Exception as exc:
         print(f"[observability] failed to begin stage '{stage}': {exc}")
 
@@ -437,17 +454,33 @@ def log_stage(
         opened = trace.open_spans.pop(stage, None)
         span = opened.span if opened is not None else trace.root.start_observation(name=stage, as_type="span")
         resources = opened.sampler.stop() if opened is not None and opened.sampler is not None else {}
+        usage_summary: dict = {}
+        if opened is not None and getattr(opened, "usage", None) is not None:
+            try:
+                usage_summary = opened.usage.summary(float(elapsed_seconds))
+            except Exception as exc:
+                print(f"[observability] failed to summarise usage for '{stage}': {exc}")
+        has_jobs = bool(usage_summary.get("jobs") or usage_summary.get("jobs_unreconciled"))
 
         span.update(
             output={"ok": ok, **(extra or {})},
-            metadata={"cached": cached, "elapsed_seconds": round(float(elapsed_seconds), 2), **resources},
+            metadata={
+                "cached": cached,
+                "elapsed_seconds": round(float(elapsed_seconds), 2),
+                **resources,
+                **({"comfy": usage_summary} if has_jobs else {}),
+            },
             level="DEFAULT" if ok else "ERROR",
             status_message=error,
         )
         span.end()
         if opened is not None:
             _active_parent.set(None)
+            _active_usage.set(None)
 
+        if has_jobs:
+            trace.usage_by_stage[stage] = usage_summary
+            _write_usage_scores(trace, stage, usage_summary)
         if "gpu_mem_peak_mib" in resources:
             score_trace(trace, f"gpu_peak_mib:{stage}", resources["gpu_mem_peak_mib"])
         if "ram_used_peak_mib" in resources:
@@ -489,6 +522,7 @@ def finish_trace(
     status: str,
     stage_reached: str,
     selection_flag_count: int = 0,
+    images_kept: int | None = None,
 ) -> None:
     """
     Closes out a product's trace: final output on the root span, summary
@@ -509,11 +543,47 @@ def finish_trace(
         score_trace(trace, "completed", 1 if status == "ok" else 0)
         if selection_flag_count:
             score_trace(trace, "themes_below_threshold", selection_flag_count)
+        if images_kept is not None:
+            # Kept = what Agent 5 selected. Produced minus kept is the
+            # by-design cost of choosing (candidate surplus), reported
+            # separately from failed-attempt waste (gpu_wasted_s:images).
+            score_trace(trace, "images_kept", images_kept)
+            gen = trace.usage_by_stage.get("images")
+            if gen:
+                if gen.get("images_produced") is not None:
+                    score_trace(trace, "selection_surplus", max(0, gen["images_produced"] - images_kept))
+                if images_kept > 0 and gen.get("gpu_s") is not None:
+                    score_trace(trace, "gpu_s_per_kept_image", round(gen["gpu_s"] / images_kept, 1))
         trace.root.end()
     except Exception as exc:
         print(f"[observability] failed to finalize trace: {exc}")
     finally:
         _active_parent.set(None)
+        _active_usage.set(None)
+
+
+def abort_trace(trace: Optional[TraceHandle], reason: str = "interrupted") -> None:
+    """
+    Closes a trace whose run was cancelled (Ctrl-C arrives as
+    asyncio.CancelledError inside run_product, which `except Exception`
+    does not catch). Without this the root and open stage span are never
+    ended, so a 33-minute video stage that is interrupted exports nothing
+    for the stage itself. Never raises; the caller re-raises the cancel.
+    """
+    if trace is None:
+        return
+    try:
+        for stage in list(trace.open_spans):
+            log_stage(trace, stage, ok=False, elapsed_seconds=0.0, error=reason)
+        trace.root.update(output={"status": reason}, level="WARNING", status_message=reason)
+        score_trace(trace, "completed", 0)
+        trace.root.end()
+    except Exception as exc:
+        print(f"[observability] failed to abort trace: {exc}")
+    finally:
+        _active_parent.set(None)
+        _active_usage.set(None)
+    flush()
 
 
 def flush() -> None:
@@ -681,3 +751,792 @@ async def ollama_memory(host: str, model: str, timeout: float = 2.0) -> dict:
         if match.get("context_length"):
             out["ollama_context_length"] = match["context_length"]
     return out
+
+
+# --------------------------------------------------------------------------
+# GPU job telemetry: what one local diffusion job cost
+#
+# Diffusion models have no tokens, so "usage" is defined as GPU time plus
+# work units, and every ComfyUI attempt becomes one `generation`
+# observation under the running stage:
+#
+#   usage_details (integers only - the SDK type is Dict[str, int])
+#       gpu_ms          ComfyUI's own execution time (execution_start ->
+#                       execution_success/error/interrupted from /history),
+#                       NOT client wall time. 0 when unknown (a timed-out
+#                       job; see reconcile_abandoned()).
+#       queue_wait_ms   execution_start - extra_data.create_time (both are
+#                       ComfyUI server timestamps - no client clock needed)
+#       wait_ms/save_ms/wall_ms   client-side phases of the attempt
+#       images_requested / images_produced      (image jobs)
+#       videos_requested / videos_produced / frames   (video jobs)
+#       sampler_steps   steps of a job that completed
+#       energy_mwh      board energy integrated from nvidia-smi power.draw
+#       total           = gpu_ms (set explicitly so the server does not
+#                       invent a meaningless sum of unrelated keys)
+#   metadata            per-job detail: outcome, prompt_id, seed, queue
+#                       state at start, throughput, GPU utilisation / power
+#                       / clocks / throttling, VRAM, Ollama and RAM context.
+#
+# A per-stage accumulator (StageUsage) sums the attempts so log_stage() can
+# write the few derived trace scores that a dashboard cannot compute from
+# the observations alone (waste, duty cycle, retries).
+#
+# Same contract as everything above: best-effort, never raises, and with no
+# active stage (tracing off, or an agent run standalone) it is a no-op that
+# makes NO extra HTTP or subprocess calls.
+# --------------------------------------------------------------------------
+
+_SMI_CORE = (
+    "utilization.gpu",
+    "utilization.memory",
+    "power.draw",
+    "clocks.sm",
+    "clocks.mem",
+    "clocks.max.sm",
+    "temperature.gpu",
+    "memory.used",
+    "memory.total",
+    "pstate",
+    "clocks_throttle_reasons.active",
+)
+# Cumulative microseconds spent throttled; a delta over a job is exact where
+# sampling the bitmask can miss short events. Newer drivers only.
+_SMI_COUNTERS = (
+    "clocks_event_reasons_counters.sw_power_cap",
+    "clocks_event_reasons_counters.sw_thermal_slowdown",
+    "clocks_event_reasons_counters.hw_thermal_slowdown",
+    "clocks_event_reasons_counters.hw_power_brake_slowdown",
+)
+_SMI_MINIMAL = ("utilization.gpu", "utilization.memory", "memory.used", "memory.total")
+_SMI_TIERS = (_SMI_CORE + _SMI_COUNTERS, _SMI_CORE, _SMI_MINIMAL)
+_smi_tier: int | None = None
+_smi_tier_lock = threading.Lock()
+
+# nvml.h clocks-throttle-reason bits (gpu_idle=0x1 and display_clock=0x100
+# are deliberately not counted as throttling).
+_THROTTLE_BITS = {
+    0x02: "app_clocks",
+    0x04: "sw_power_cap",
+    0x08: "hw_slowdown",
+    0x10: "sync_boost",
+    0x20: "sw_thermal",
+    0x40: "hw_thermal",
+    0x80: "hw_power_brake",
+}
+_THROTTLE_PENALTY = ("sw_power_cap", "hw_slowdown", "sw_thermal", "hw_thermal", "hw_power_brake")
+_THROTTLE_COUNTER_NAMES = {
+    "clocks_event_reasons_counters.sw_power_cap": "sw_power_cap",
+    "clocks_event_reasons_counters.sw_thermal_slowdown": "sw_thermal",
+    "clocks_event_reasons_counters.hw_thermal_slowdown": "hw_thermal",
+    "clocks_event_reasons_counters.hw_power_brake_slowdown": "hw_power_brake",
+}
+
+
+def _parse_smi_value(raw: str) -> Any:
+    v = raw.strip()
+    if not v or v.startswith("[") or v.upper() in ("N/A", "NOT SUPPORTED", "UNKNOWN ERROR"):
+        return None
+    if v.lower().startswith("0x"):
+        try:
+            return int(v, 16)
+        except ValueError:
+            return None
+    if len(v) >= 2 and v[0] in "Pp" and v[1:].isdigit():
+        return int(v[1:])
+    try:
+        return int(v) if v.lstrip("-").isdigit() else float(v)
+    except ValueError:
+        return None
+
+
+def _smi_run(fields: tuple[str, ...]) -> tuple[int | None, dict | None]:
+    """(returncode, row). returncode is None when the call itself failed
+    (timeout, exec error) - which is NOT evidence the fields are invalid."""
+    smi = _find_smi()
+    if not smi:
+        return None, None
+    try:
+        kwargs: dict = {}
+        if sys.platform.startswith("win"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run(
+            [smi, f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, **kwargs,
+        )
+        if proc.returncode != 0:
+            return proc.returncode, None
+        lines = proc.stdout.strip().splitlines()
+        if not lines:
+            return 0, None
+        parts = lines[0].split(",")
+        if len(parts) != len(fields):
+            return 0, None
+        return 0, {f: _parse_smi_value(p) for f, p in zip(fields, parts)}
+    except Exception:
+        return None, None
+
+
+def gpu_snapshot() -> dict | None:
+    """One richer nvidia-smi reading for GPU 0 (utilisation, power, clocks,
+    temperature, memory, throttle state). Field support differs by driver,
+    so the first call probes three field sets from richest to minimal and
+    latches the first that the installed nvidia-smi accepts. Fields a laptop
+    GPU does not report come back None. Whole-card figures - see _gpu_mib."""
+    global _smi_tier
+    try:
+        if _smi_tier is None:
+            with _smi_tier_lock:
+                if _smi_tier is None:
+                    rejected = 0
+                    for i, fields in enumerate(_SMI_TIERS):
+                        rc, row = _smi_run(fields)
+                        if row is not None:
+                            _smi_tier = i
+                            return row
+                        if rc not in (None, 0):
+                            rejected += 1
+                    if rejected == len(_SMI_TIERS):  # every set refused: stop trying
+                        _smi_tier = len(_SMI_TIERS)
+                    return None
+        if _smi_tier >= len(_SMI_TIERS):
+            return None
+        return _smi_run(_SMI_TIERS[_smi_tier])[1]
+    except Exception:
+        return None
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _summarize_gpu_samples(samples: list[dict], failures: int) -> dict:
+    """Pure function (unit-tested): sampled nvidia-smi rows -> job metadata."""
+    out: dict[str, Any] = {"gpu_samples": len(samples), "gpu_sample_failures": failures}
+    if not samples:
+        return out
+
+    def col(key: str) -> list[tuple[float, float]]:
+        return [(s["_t"], s[key]) for s in samples if s.get(key) is not None]
+
+    util = [v for _, v in col("utilization.gpu")]
+    if util:
+        out["gpu_util_mean_pct"] = round(_mean(util), 1)
+        out["gpu_util_low_sample_pct"] = round(100 * sum(1 for v in util if v < 50) / len(util), 1)
+    mem_util = [v for _, v in col("utilization.memory")]
+    if mem_util:
+        out["gpu_mem_util_mean_pct"] = round(_mean(mem_util), 1)
+
+    power = col("power.draw")
+    if power:
+        watts = [v for _, v in power]
+        out["gpu_power_mean_w"] = round(_mean(watts), 1)
+        out["gpu_power_max_w"] = round(max(watts), 1)
+        if len(power) >= 2:
+            joules = sum(
+                (power[i][1] + power[i + 1][1]) / 2 * (power[i + 1][0] - power[i][0])
+                for i in range(len(power) - 1)
+            )
+            out["gpu_energy_mwh"] = int(round(joules / 3.6))  # J -> mWh
+
+    sm = [v for _, v in col("clocks.sm")]
+    if sm:
+        out["gpu_clock_sm_mean_mhz"] = round(_mean(sm))
+        max_sm = next((v for _, v in col("clocks.max.sm")), None)
+        if max_sm:
+            out["gpu_clock_sm_max_mhz"] = round(max_sm)
+            out["gpu_clock_ratio"] = round(_mean(sm) / max_sm, 3)
+    mem_clk = [v for _, v in col("clocks.mem")]
+    if mem_clk:
+        out["gpu_clock_mem_mean_mhz"] = round(_mean(mem_clk))
+    temp = [v for _, v in col("temperature.gpu")]
+    if temp:
+        out["gpu_temp_max_c"] = round(max(temp))
+
+    used = [v for _, v in col("memory.used")]
+    if used:
+        out["gpu_mem_start_mib"] = round(used[0])
+        out["gpu_mem_peak_mib"] = round(max(used))
+    total = next((v for _, v in col("memory.total")), None)
+    if total:
+        out["gpu_mem_total_mib"] = round(total)
+
+    masks = [int(v) for _, v in col("clocks_throttle_reasons.active")]
+    if masks:
+        pct: dict[str, float] = {}
+        for bit, name in _THROTTLE_BITS.items():
+            p = round(100 * sum(1 for m in masks if m & bit) / len(masks), 1)
+            if p:
+                pct[name] = p
+        out["gpu_throttle_reasons_pct"] = pct
+        penalty_bits = [b for b, n in _THROTTLE_BITS.items() if n in _THROTTLE_PENALTY]
+        out["gpu_throttled_sample_pct"] = round(
+            100 * sum(1 for m in masks if any(m & b for b in penalty_bits)) / len(masks), 1
+        )
+
+    deltas: dict[str, int] = {}
+    for key, name in _THROTTLE_COUNTER_NAMES.items():
+        vals = [v for _, v in col(key)]
+        if len(vals) >= 2 and vals[-1] >= vals[0]:
+            deltas[name] = int(round((vals[-1] - vals[0]) / 1000))  # us -> ms
+    if deltas:
+        out["gpu_throttle_ms"] = deltas
+    return out
+
+
+def _gpu_sampling_enabled() -> bool:
+    return os.getenv("OBS_RESOURCE_SAMPLING", "1") != "0" and _find_smi() is not None
+
+
+def _job_sample_interval() -> float:
+    try:
+        return max(0.5, float(os.getenv("OBS_JOB_SAMPLE_INTERVAL_SECONDS", "2")))
+    except ValueError:
+        return 2.0
+
+
+class _JobSampler:
+    """Polls gpu_snapshot() on a daemon thread for the duration of ONE job.
+    nvidia-smi is independent of ComfyUI's HTTP server, which is why this
+    works while ComfyUI is busy sampling and cannot answer requests."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.samples: list[dict] = []
+        self.failures = 0
+
+    def _sample(self) -> None:
+        try:
+            row = gpu_snapshot()
+        except Exception:
+            row = None
+        if row is None:
+            self.failures += 1
+            return
+        row["_t"] = time.monotonic()
+        self.samples.append(row)
+
+    def _run(self) -> None:
+        self._sample()
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True, name="obs-job-sampler")
+        self._thread.start()
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        self._sample()  # closing reading: end-of-job counters/clocks
+        return _summarize_gpu_samples(self.samples, self.failures)
+
+
+def ollama_resident_vram_mib(host: str, timeout: float = 1.5) -> dict:
+    """Sync twin of ollama_memory() for code running in worker threads: total
+    GPU memory held by whatever Ollama has loaded right now. Context for a
+    slow ComfyUI job on a card shared with Ollama. {} on any failure."""
+    try:
+        import json as _json
+        import urllib.request
+
+        with urllib.request.urlopen(host.rstrip("/") + "/api/ps", timeout=timeout) as resp:
+            loaded = _json.loads(resp.read().decode("utf-8")).get("models", [])
+        return {
+            "ollama_loaded_models": [m.get("name") for m in loaded],
+            "ollama_vram_mib_start": round(sum((m.get("size_vram") or 0) for m in loaded) / 1048576),
+        }
+    except Exception:
+        return {}
+
+
+def comfy_job_timing(entry: dict | None) -> dict:
+    """
+    Pure parser for one ComfyUI /history entry (unit-tested against a real
+    entry from ComfyUI 0.28.0). Everything is milliseconds on the SERVER's
+    clock, so no client clock is involved:
+
+        queue_wait_ms = execution_start.timestamp - prompt[3].create_time
+        gpu_ms        = <final event>.timestamp  - execution_start.timestamp
+
+    where <final event> is execution_success, execution_error or
+    execution_interrupted. Missing pieces are simply absent from the result.
+    """
+    out: dict[str, Any] = {}
+    try:
+        if not isinstance(entry, dict):
+            return out
+        prompt = entry.get("prompt")
+        create = None
+        if isinstance(prompt, (list, tuple)) and len(prompt) > 3 and isinstance(prompt[3], dict):
+            create = prompt[3].get("create_time")
+        start = end = None
+        for msg in (entry.get("status") or {}).get("messages") or []:
+            if not (isinstance(msg, (list, tuple)) and len(msg) == 2 and isinstance(msg[1], dict)):
+                continue
+            event, data = msg
+            if event == "execution_start":
+                start = data.get("timestamp")
+            elif event == "execution_cached":
+                out["cached_nodes"] = len(data.get("nodes") or [])
+            elif event in ("execution_success", "execution_error", "execution_interrupted"):
+                end = data.get("timestamp")
+                out["final_event"] = event
+        if start is not None and end is not None and end >= start:
+            out["gpu_ms"] = int(end - start)
+        if start is not None and create is not None and start >= create:
+            out["queue_wait_ms"] = int(start - create)
+        count = 0
+        for node_out in (entry.get("outputs") or {}).values():
+            if isinstance(node_out, dict):
+                for value in node_out.values():
+                    if isinstance(value, list):
+                        count += sum(1 for item in value if isinstance(item, dict) and "filename" in item)
+        out["outputs_count"] = count
+    except Exception:
+        pass
+    return out
+
+
+class StageUsage:
+    """Thread-safe accumulator of the ComfyUI jobs one stage ran in this
+    process. Lives on the stage (a ContextVar, like the active span) and
+    never in LangGraph state, so nothing here touches checkpoints or the
+    msgpack allow-list."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.jobs: list[dict] = []
+        self.abandoned: list[dict] = []
+
+    def add_job(self, rec: dict) -> None:
+        with self._lock:
+            self.jobs.append(rec)
+
+    def add_abandoned(self, item: dict) -> None:
+        with self._lock:
+            self.abandoned.append(item)
+
+    def pending_abandoned(self) -> list[dict]:
+        with self._lock:
+            return [a for a in self.abandoned if a.get("gpu_ms") is None]
+
+    def resolve(self, prompt_id: str, **fields: Any) -> None:
+        with self._lock:
+            for a in self.abandoned:
+                if a["prompt_id"] == prompt_id:
+                    a.update(fields)
+
+    def summary(self, elapsed_seconds: float | None = None) -> dict:
+        with self._lock:
+            jobs = list(self.jobs)
+            abandoned = list(self.abandoned)
+        resolved = [a for a in abandoned if a.get("gpu_ms") is not None]
+        ab_ms = sum(a["gpu_ms"] for a in resolved)
+        total_ms = sum(j["gpu_ms"] for j in jobs) + ab_ms
+        wasted_ms = sum(j["gpu_ms"] for j in jobs if j["outcome"] != "success") + ab_ms
+        out: dict[str, Any] = {
+            "jobs": len(jobs),
+            "jobs_ok": sum(1 for j in jobs if j["outcome"] == "success"),
+            "jobs_timed_out": sum(1 for j in jobs if j["outcome"] == "timeout"),
+            "jobs_failed": sum(1 for j in jobs if j["outcome"] not in ("success", "timeout")),
+            "gpu_s": round(total_ms / 1000, 1),
+            "gpu_wasted_s": round(wasted_ms / 1000, 1),
+            "wall_s": round(sum(j["wall_ms"] for j in jobs) / 1000, 1),
+            "jobs_unreconciled": sum(1 for a in abandoned if a.get("gpu_ms") is None),
+        }
+        if total_ms > 0:
+            out["waste_pct"] = round(100 * wasted_ms / total_ms, 1)
+        themes = {j["theme_index"] for j in jobs if j.get("theme_index") is not None}
+        if themes:
+            out["retries"] = len(jobs) - len(themes)
+        energy = [j["energy_mwh"] for j in jobs if j.get("energy_mwh") is not None]
+        if energy:
+            out["energy_wh"] = round(sum(energy) / 1000, 2)
+        behind = [j for j in jobs if j.get("queue_running_at_start") is not None]
+        if behind:
+            out["jobs_started_behind_running"] = sum(1 for j in behind if j["queue_running_at_start"] > 0)
+        for unit in ("images", "videos"):
+            rows = [j for j in jobs if j.get("unit") == unit]
+            if rows:
+                out[f"{unit}_requested"] = sum(j["requested"] for j in rows)
+                out[f"{unit}_produced"] = sum(j["produced"] for j in rows)
+        weighted = [(j["gpu_ms"], j["throttled_pct"]) for j in jobs if j.get("throttled_pct") is not None and j["gpu_ms"] > 0]
+        if weighted:
+            out["gpu_throttled_pct"] = round(sum(w * p for w, p in weighted) / sum(w for w, _ in weighted), 1)
+        if elapsed_seconds and elapsed_seconds > 0 and total_ms > 0:
+            out["gpu_duty_pct"] = round(100 * (total_ms / 1000) / elapsed_seconds, 1)
+        return out
+
+
+# The accumulator of the stage currently running (see begin_stage).
+_active_usage: contextvars.ContextVar[Any] = contextvars.ContextVar("obs_active_usage", default=None)
+
+
+def _clean_params(params: dict | None) -> dict | None:
+    return {k: v for k, v in (params or {}).items() if v is not None} or None
+
+
+class ComfyJob:
+    """Handle yielded by comfy_job(). Every method is a no-op when the job
+    is not being traced and none of them can raise."""
+
+    def __init__(self, spec: dict):
+        self.spec = spec
+        self.span: Any = None
+        self.prompt_id: str | None = None
+        self.outcome: str | None = None
+        self.message: str | None = None
+        self._phase = "setup"
+        self._t0 = time.monotonic()
+        self._t_submit: float | None = None
+        self._t_done: float | None = None
+        self._timing: dict = {}
+        self._meta: dict[str, Any] = {}
+        self._output: Any = None
+        self._produced = 0
+        self._probes: dict[str, Callable] = {}
+        self._sampler: _JobSampler | None = None
+        self._queue_running: int | None = None
+
+    # -- lifecycle ----------------------------------------------------------
+    @property
+    def active(self) -> bool:
+        return self.span is not None
+
+    @property
+    def current_phase(self) -> str:
+        return self._phase
+
+    def _open(self, parent: Any) -> None:
+        spec = self.spec
+        try:
+            self.span = parent.start_observation(
+                as_type="generation",
+                name=spec["name"],
+                model=spec.get("model"),
+                input=_clip(spec.get("input")),
+                model_parameters=_clean_params(spec.get("model_parameters")),
+                metadata={"provider": "comfyui", "kind": spec["kind"], **(spec.get("metadata") or {})},
+            )
+        except Exception as exc:
+            self.span = None
+            print(f"[observability] failed to start comfy job '{spec.get('name')}': {exc}")
+            return
+        try:
+            if _gpu_sampling_enabled():
+                self._sampler = _JobSampler(_job_sample_interval())
+                self._sampler.start()
+        except Exception:
+            self._sampler = None
+
+    # -- called from the node -----------------------------------------------
+    def set_probes(self, **probes: Callable) -> None:
+        """queue=, stats=, history= : zero-arg-safe callables from the
+        ComfyUI client. Only ever invoked when the job is active."""
+        self._probes.update(probes)
+
+    def probe_start(self) -> None:
+        """Context at job start: what is already queued/running in ComfyUI
+        (stale jobs from a previous timeout), ComfyUI's own VRAM/RAM view,
+        and how much GPU memory Ollama is holding."""
+        if not self.active:
+            return
+        try:
+            queue = self._probes.get("queue")
+            snap = queue() if queue else None
+            if snap:
+                self._queue_running = snap.get("running")
+                self._meta["queue_running_at_start"] = snap.get("running")
+                self._meta["queue_pending_at_start"] = snap.get("pending")
+            stats = self._probes.get("stats")
+            st = stats() if stats else None
+            if st:
+                for key in ("comfyui_version", "device", "vram_free_mib", "ram_free_mib", "ram_total_mib"):
+                    if st.get(key) is not None:
+                        self._meta[f"comfy_{key}_start" if key.endswith("mib") else f"comfy_{key}"] = st[key]
+            host = self.spec.get("ollama_host")
+            if host:
+                self._meta.update(ollama_resident_vram_mib(host))
+            ram = _ram_available_mib()
+            if ram is not None:
+                self._meta["ram_available_mib_start"] = ram
+        except Exception:
+            pass
+
+    def phase(self, name: str) -> None:
+        self._phase = name
+
+    def set_meta(self, **meta: Any) -> None:
+        self._meta.update({k: v for k, v in meta.items() if v is not None})
+
+    def submitted(self, prompt_id: str) -> None:
+        self.prompt_id = prompt_id
+        self._t_submit = time.monotonic()
+        self._phase = "wait"
+
+    def completed(self, history_entry: dict | None) -> None:
+        self._t_done = time.monotonic()
+        self._timing = comfy_job_timing(history_entry)
+        self._phase = "save"
+
+    def outputs(self, names: list[str], produced: int) -> None:
+        self._output = {"files": names}
+        self._produced = produced
+
+    def fail(self, outcome: str, message: str | None = None, *, abandoned: bool = False) -> None:
+        """Record why the attempt failed. `abandoned=True` means the client
+        gave up while ComfyUI may still be running the job (timeout, lost
+        connection): its true GPU time is filled in later by
+        reconcile_abandoned()."""
+        self.outcome = outcome
+        self.message = (message or outcome)[:500]
+        if abandoned and self.prompt_id:
+            usage = _active_usage.get()
+            if usage is not None:
+                usage.add_abandoned({
+                    "prompt_id": self.prompt_id,
+                    "kind": self.spec["kind"],
+                    "model": self.spec.get("model"),
+                    "theme_index": (self.spec.get("metadata") or {}).get("theme_index"),
+                    "attempt": (self.spec.get("metadata") or {}).get("attempt"),
+                    "reason": outcome,
+                    "gpu_ms": None,
+                })
+
+    def unusable(self, outcome: str) -> None:
+        """The job finished but its output is not usable (e.g. wrong image
+        count): counted as waste even though ComfyUI reported success."""
+        if self.outcome is None:
+            self.outcome = outcome
+            self.message = outcome
+
+    # -- closing ------------------------------------------------------------
+    def _close(self, exc: BaseException | None) -> None:
+        if self.span is None:
+            return
+        span, self.span = self.span, None
+        try:
+            t_end = time.monotonic()
+            resources = self._sampler.stop() if self._sampler is not None else {}
+            outcome = self.outcome or ("exception" if exc is not None else "success")
+
+            timing = self._timing
+            history = self._probes.get("history")
+            if not timing.get("gpu_ms") and self.prompt_id and history and outcome in ("comfy_error", "no_output"):
+                timing = comfy_job_timing(history(self.prompt_id))
+            end_stats = None
+            stats = self._probes.get("stats")
+            if stats and outcome not in ("timeout", "connection_error"):
+                end_stats = stats()  # skipped when ComfyUI is likely still busy
+
+            spec = self.spec
+            unit = spec.get("unit", "images")
+            requested = int(spec.get("requested", 1))
+            produced = int(self._produced)
+            gpu_ms = int(timing.get("gpu_ms") or 0)
+            wall_ms = int((t_end - self._t0) * 1000)
+            if self._t_submit is not None:
+                wait_ms = int(((self._t_done or t_end) - self._t_submit) * 1000)
+            else:
+                wait_ms = 0
+            save_ms = int((t_end - self._t_done) * 1000) if self._t_done is not None else 0
+            ok = outcome == "success"
+
+            usage: dict[str, int] = {
+                "gpu_ms": gpu_ms,
+                "queue_wait_ms": int(timing.get("queue_wait_ms") or 0),
+                "wait_ms": wait_ms,
+                "save_ms": save_ms,
+                "wall_ms": wall_ms,
+                f"{unit}_requested": requested,
+                f"{unit}_produced": produced,
+                "total": gpu_ms,
+            }
+            if ok and spec.get("steps"):
+                usage["sampler_steps"] = int(spec["steps"])
+            if ok and spec.get("frames"):
+                usage["frames"] = int(spec["frames"])
+            energy = resources.get("gpu_energy_mwh")
+            if energy is not None:
+                usage["energy_mwh"] = int(energy)
+
+            meta: dict[str, Any] = {
+                "outcome": outcome,
+                "phase_at_end": self._phase,
+                "prompt_id": self.prompt_id,
+                "cached_nodes": timing.get("cached_nodes"),
+                "warm": (timing.get("cached_nodes") or 0) > 0 if "cached_nodes" in timing else None,
+                "comfy_final_event": timing.get("final_event"),
+                "comfy_outputs_count": timing.get("outputs_count"),
+            }
+            gpu_s = gpu_ms / 1000
+            if ok and gpu_s > 0:
+                if unit == "images" and produced:
+                    meta["sec_per_image"] = round(gpu_s / produced, 2)
+                    meta["images_per_min"] = round(produced / gpu_s * 60, 2)
+                    if spec.get("width") and spec.get("height"):
+                        meta["megapixels_per_s"] = round(spec["width"] * spec["height"] * produced / 1e6 / gpu_s, 4)
+                if unit == "videos" and spec.get("frames"):
+                    meta["sec_per_frame"] = round(gpu_s / spec["frames"], 2)
+                    meta["frames_per_min"] = round(spec["frames"] / gpu_s * 60, 2)
+                if spec.get("steps"):
+                    meta["sec_per_step"] = round(gpu_s / spec["steps"], 2)
+            if energy is not None and produced and ok:
+                meta["energy_mwh_per_unit"] = round(energy / produced, 1)
+            meta.update(self._meta)
+            meta.update(resources)
+            if end_stats:
+                for key in ("vram_free_mib", "torch_vram_total_mib", "torch_vram_free_mib", "ram_free_mib"):
+                    if end_stats.get(key) is not None:
+                        meta[f"comfy_{key}_end"] = end_stats[key]
+            # Whole-card used-VRAM figures from the sampler are the reliable
+            # ones here; ComfyUI's own torch_vram_* are recorded raw so you
+            # can judge whether they move on your allocator (cudaMallocAsync).
+
+            error = None
+            if exc is not None:
+                error = f"{type(exc).__name__}: {str(exc)[:500]}"
+            elif not ok:
+                error = self.message or outcome
+
+            rec = _Recorder(span, "generation")
+            rec.record(output=self._output, usage=usage, metadata=meta)
+            rec.close(error=error)
+
+            acc = _active_usage.get()
+            if acc is not None:
+                acc.add_job({
+                    "outcome": outcome,
+                    "gpu_ms": gpu_ms,
+                    "wall_ms": wall_ms,
+                    "unit": unit,
+                    "requested": requested,
+                    "produced": produced,
+                    "energy_mwh": energy,
+                    "theme_index": (spec.get("metadata") or {}).get("theme_index"),
+                    "queue_running_at_start": self._queue_running,
+                    "throttled_pct": resources.get("gpu_throttled_sample_pct"),
+                })
+        except Exception as exc2:
+            print(f"[observability] failed to close comfy job: {exc2}")
+            try:
+                span.end()
+            except Exception:
+                pass
+
+
+@contextmanager
+def comfy_job(**spec: Any) -> Iterator[ComfyJob]:
+    """
+    Context manager around ONE ComfyUI attempt (queue -> wait -> download).
+    Required spec: kind ("image"|"video"), name, model. Optional: input,
+    model_parameters, metadata (theme_index/attempt/seed...), unit
+    ("images"|"videos"), requested, steps, frames, width, height,
+    ollama_host.
+
+    Attaches to the running stage like generation() does; with no active
+    stage it yields an inactive job whose methods all do nothing. A node
+    that handles its own exceptions must call job.fail(...) before leaving
+    the block; an exception that escapes is recorded as outcome
+    "exception" and re-raised unchanged.
+    """
+    job = ComfyJob(spec)
+    parent = _active_parent.get()
+    if parent is not None:
+        job._open(parent)
+    try:
+        yield job
+    except BaseException as exc:
+        job._close(exc)
+        raise
+    else:
+        job._close(None)
+
+
+def reconcile_abandoned(fetch_entry: Callable[[str], dict | None]) -> int:
+    """
+    Fills in the real GPU time of jobs the client gave up on (timeouts, lost
+    connections). Such a job keeps running in ComfyUI, so at the moment of
+    the timeout its cost is unknown; later its /history entry says exactly
+    how long it ran. For each pending job whose entry is now final this
+    emits a `comfyui.abandoned_job` generation (spans cannot be backdated,
+    so it is a new, short observation carrying the usage) and adds the time
+    to the stage's wasted GPU seconds. Jobs still running stay pending and
+    are reported as `jobs_unreconciled` at stage end.
+
+    Call at the start of each attempt and when the stage's graph finishes.
+    No-op without an active stage. Returns the number resolved.
+    """
+    usage = _active_usage.get()
+    if usage is None:
+        return 0
+    resolved = 0
+    try:
+        for item in usage.pending_abandoned():
+            entry = fetch_entry(item["prompt_id"])
+            timing = comfy_job_timing(entry)
+            if timing.get("gpu_ms") is None:
+                continue
+            usage.resolve(item["prompt_id"], gpu_ms=int(timing["gpu_ms"]), final_event=timing.get("final_event"))
+            resolved += 1
+            with _observation(
+                "generation",
+                name="comfyui.abandoned_job",
+                model=item.get("model"),
+                input={"prompt_id": item["prompt_id"]},
+                metadata={
+                    "provider": "comfyui",
+                    "kind": item["kind"],
+                    "theme_index": item.get("theme_index"),
+                    "attempt": item.get("attempt"),
+                    "abandoned_because": item.get("reason"),
+                    "comfy_final_event": timing.get("final_event"),
+                    "comfy_outputs_count": timing.get("outputs_count"),
+                    "produced_after_client_gave_up": bool(timing.get("outputs_count")),
+                },
+            ) as rec:
+                rec.record(usage={
+                    "gpu_ms": int(timing["gpu_ms"]),
+                    "queue_wait_ms": int(timing.get("queue_wait_ms") or 0),
+                    "total": int(timing["gpu_ms"]),
+                })
+    except Exception as exc:
+        print(f"[observability] reconcile failed: {exc}")
+    return resolved
+
+
+def _ram_available_mib() -> int | None:
+    if psutil is None:
+        return None
+    try:
+        return round(psutil.virtual_memory().available / 1048576)
+    except Exception:
+        return None
+
+
+def _write_usage_scores(trace: "TraceHandle", stage: str, s: dict) -> None:
+    """The derived numbers a dashboard cannot compute from observations."""
+    if not (s.get("jobs") or s.get("jobs_unreconciled")):
+        return
+    pairs = {
+        f"gpu_s:{stage}": s.get("gpu_s"),
+        f"gpu_wasted_s:{stage}": s.get("gpu_wasted_s"),
+        f"waste_pct:{stage}": s.get("waste_pct"),
+        f"jobs_timed_out:{stage}": s.get("jobs_timed_out"),
+        f"jobs_failed:{stage}": s.get("jobs_failed"),
+        f"retries:{stage}": s.get("retries"),
+        f"gpu_duty_pct:{stage}": s.get("gpu_duty_pct"),
+        f"energy_wh:{stage}": s.get("energy_wh"),
+        f"gpu_throttled_pct:{stage}": s.get("gpu_throttled_pct"),
+        "images_requested": s.get("images_requested"),
+        "images_produced": s.get("images_produced"),
+        "videos_requested": s.get("videos_requested"),
+        "videos_produced": s.get("videos_produced"),
+    }
+    for name, value in pairs.items():
+        if value is not None:
+            score_trace(trace, name, value)
