@@ -22,8 +22,9 @@ tracing completely off, and a down or misconfigured Langfuse can cost a
 trace but never a product.
 
 This document covers the server stack (what the six Docker containers do),
-the client wrapper (`app/core/observability.py`), how the pipeline and the
-two scripts use it, the data model that ends up in Langfuse, and a
+the client wrapper (`observability/observability.py`), how the pipeline and the
+two scripts use it, the data model that ends up in Langfuse (including how
+the local ComfyUI image/video models' *usage* is defined and recorded), and a
 candid list of what is *not* observed.
 
 ## Architecture at a glance
@@ -134,7 +135,7 @@ docker compose --env-file langfuse.env -f docker-compose.langfuse.yml up -d
 Data persists in named Docker volumes. `docker compose down` keeps it;
 `docker compose down -v` deletes it, along with every trace and score.
 
-## The client wrapper: `app/core/observability.py`
+## The client wrapper: `observability/observability.py`
 
 Written against the Langfuse Python SDK **v5** (`langfuse==5.0.2`), which
 is built on OpenTelemetry. Two properties of that API shaped the module:
@@ -170,13 +171,20 @@ is built on OpenTelemetry. Two properties of that API shaped the module:
 | `enabled()` | internal | True only if the SDK imported and both keys are set |
 | `get_client()` | internal | Lazily builds one shared `Langfuse` client; `None` if tracing is off or init fails |
 | `startup_check()` | the three scripts | Returns one status line (see Verification) via `client.auth_check()` |
-| `start_trace(url, run_label)` | `run_product` | Creates the root span `product:<run_label>`; returns a `TraceHandle` or `None` |
+| `start_trace(url, run_label, session_id=None, product=None)` | `run_product` | Creates the root span `product:<run_label>`, grouped into a Langfuse session and tagged with the product slug; returns a `TraceHandle` or `None` |
 | `trace_id(trace)` | `run_product` | The 32-hex trace id, stored on `ProductRunResult` |
 | `begin_stage(trace, stage)` | `run_product` | Opens a child span for a stage that is about to genuinely run; remembers it in `trace.open_spans[stage]` |
 | `log_stage(trace, stage, ok, ...)` | `run_product`, `_fail` | Closes the stage's span (or creates-and-closes one for a checkpoint hit); sets output, level, metadata |
 | `score_trace(trace, name, value)` | `finish_trace` | Scores the live trace via the root span |
 | `score_trace_by_id(id, name, value)` | `review.py` | Scores a trace from a *different process* using only its id |
-| `finish_trace(trace, ...)` | `_finish`, `_fail` | Closes dangling spans, writes the root's output, adds summary scores, ends the root |
+| `finish_trace(trace, ..., images_kept=None)` | `_finish`, `_fail` | Closes dangling spans, writes the root's output, adds summary scores (incl. `images_kept`, `selection_surplus`, `gpu_s_per_kept_image`), ends the root |
+| `abort_trace(trace, reason)` | `run_product` (on cancel) | Closes a cancelled run's open stage and root so Ctrl-C no longer loses the in-flight product's trace |
+| `generation(...)`, `tool_span(...)` | `llm.py`, Tavily code | Child observations for LLM calls / external tool calls inside the running stage |
+| `comfy_job(kind=, name=, model=, ...)` | Agent 4/6 `generate_node` | Context manager around ONE ComfyUI attempt; records it as a `generation` with GPU usage (see "ComfyUI job usage") |
+| `reconcile_abandoned(fetch_entry)` | Agent 4/6 `generate_node` start, `finalize_node` | Fills in the real GPU time of jobs the client gave up on (timeout, lost connection) |
+| `comfy_job_timing(entry)` | internal, tests | Pure parser for a ComfyUI `/history` entry: `gpu_ms`, `queue_wait_ms`, cached nodes, final event |
+| `gpu_snapshot()` | internal | One rich `nvidia-smi` reading (utilisation, power, clocks, temperature, memory, throttle state) with driver-dependent field fallback |
+| `ollama_resident_vram_mib(host)` | internal | Sync read of `/api/ps`: GPU memory Ollama holds right now |
 | `flush()` | `_finish`, `_fail`, `review.py` | Forces the background exporter to send what it has |
 
 ### Configuration
@@ -185,6 +193,10 @@ is built on OpenTelemetry. Two properties of that API shaped the module:
 |---|---|
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | The key pair (from `langfuse.env`'s init values). Tracing is off if either is missing. |
 | `LANGFUSE_BASE_URL` | Server URL, default `http://localhost:3000`. The older `LANGFUSE_HOST` name is still accepted. |
+| `OBS_RESOURCE_SAMPLING` | `0` turns off all `nvidia-smi`/RAM sampling (stage-level and per-job). Default on. |
+| `OBS_SAMPLE_INTERVAL_SECONDS` | Stage-level memory sampling interval, default 3. |
+| `OBS_JOB_SAMPLE_INTERVAL_SECONDS` | Per-ComfyUI-job GPU sampling interval, default 2 (minimum 0.5). |
+| `OBS_MAX_TEXT_CHARS` | Truncation limit for prompts/outputs stored on observations, default 15000. |
 
 The module loads `.env` itself with `python-dotenv`. The project's other
 settings come from `.env` through pydantic-settings, which fills the
@@ -203,7 +215,8 @@ One trace per product **per command invocation**.
 |---|---|
 | Name | `product:batch` (from `run_batch.py`) or `product:video` (from `generate_videos.py`) |
 | Tags | `["batch"]` or `["video"]` |
-| Metadata | `{"run_label": ...}` |
+| Metadata | `{"run_label": ..., "product": <url slug>}` |
+| Session | The manifest's file stem (e.g. `batch_results_20261101_...`) - every product of one command invocation shares it, so a batch in Langfuse and its results CSV have the same name. `run_batch.py` and `generate_videos.py` pass it as `session_id=out_path.stem`. |
 | Root input | `{"url": <product url>}` |
 | Root output | `{"status": "ok" \| "failed", "stage_reached": ...}` |
 
@@ -216,7 +229,8 @@ Names: `research`, `creative`, `prompts`, `images`, `selection`, `videos`.
 | Duration | Real wall-clock for a stage that ran; ~0 for a checkpoint hit |
 | Metadata | `cached` (bool), `elapsed_seconds` (the stage's compute time - for a cache hit, the *original* time from the checkpoint's metadata) |
 | Output | `{"ok": bool, ...extras}` |
-| Extras | `model_used` (creative, prompts); `total_images`, `themes` (images); `videos_generated` (videos) |
+| Extras | `model_used` (creative: one model; prompts: comma-joined set of the per-theme models that succeeded); `total_images`, `themes` (images); `videos_generated` (videos) |
+| `comfy` metadata | For `images`/`videos` stages that ran ComfyUI jobs in this process: the stage's usage summary (jobs, ok/timed-out/failed, GPU seconds, wasted GPU seconds, waste %, retries, energy, duty cycle, unreconciled jobs). Absent when the stage ran no jobs (e.g. a thread that was already complete), so zero jobs is not a failure. |
 | Level | `DEFAULT` on success, `ERROR` on failure, with the error text as `status_message` |
 
 ### Scores
@@ -226,6 +240,111 @@ Names: `research`, `creative`, `prompts`, `images`, `selection`, `videos`.
 | `completed` | `finish_trace` | 1 if the product finished the requested stages, else 0 |
 | `themes_below_threshold` | `finish_trace` | Count of themes Agent 5 selected below its confidence threshold (written only when > 0) |
 | `human_approval` | `review.py` | 1 approved / 0 rejected, with the reviewer's reason as the comment |
+| `gpu_s:<stage>`, `gpu_wasted_s:<stage>`, `waste_pct:<stage>` | `log_stage` (images, videos) | GPU seconds the stage spent in this run, how many went to attempts whose output was thrown away, and the percentage |
+| `jobs_timed_out:<stage>`, `jobs_failed:<stage>`, `retries:<stage>` | `log_stage` | Attempt outcomes; retries = attempts minus distinct themes |
+| `gpu_duty_pct:<stage>` | `log_stage` | Share of the stage's wall clock that ComfyUI was executing |
+| `energy_wh:<stage>`, `gpu_throttled_pct:<stage>` | `log_stage` | Board energy integrated from `power.draw`; share of GPU time spent power/thermal throttled (job-weighted) |
+| `images_requested`, `images_produced`, `videos_requested`, `videos_produced` | `log_stage` | Work requested vs produced across attempts |
+| `images_kept`, `selection_surplus`, `gpu_s_per_kept_image` | `finish_trace` | Themes with a selected image; produced minus kept (by-design cost of choosing); GPU seconds per kept image (only when the images stage ran in this process) |
+
+Scores exist only for numbers a dashboard cannot derive from the
+observations themselves. Everything summable (GPU ms, images, energy) lives
+in `usage_details` instead - see below.
+
+### ComfyUI job usage (Agents 4 and 6)
+
+Diffusion models have no tokens, so **usage is defined as GPU time plus work
+units**. Every ComfyUI attempt (`generate_node` call) is one `generation`
+observation under the running stage: `comfyui.image_batch`, `comfyui.video`,
+plus `comfyui.abandoned_job` (below). It is a generation rather than a tool
+span because only generations carry `usage_details`, which is what a
+dashboard can sum.
+
+`usage_details` (integers only - the SDK type is `Dict[str, int]`):
+
+| Key | Meaning |
+|---|---|
+| `gpu_ms` | ComfyUI's own execution time: `execution_start` to `execution_success`/`_error`/`_interrupted` from `/history`, not client wall time. 0 when unknown (a timed-out job - see reconciliation). |
+| `queue_wait_ms` | `execution_start` minus the entry's `extra_data.create_time` (both ComfyUI server timestamps, so no client clock is involved) |
+| `wait_ms`, `save_ms`, `wall_ms` | Client-side phases: waiting for completion, downloading+saving, whole attempt |
+| `images_requested`, `images_produced` | Image jobs: the latent batch size vs images actually saved |
+| `videos_requested`, `videos_produced`, `frames` | Video jobs |
+| `sampler_steps` | Steps of a job that completed |
+| `energy_mwh` | Board energy over the attempt, integrated from `power.draw` samples (includes idle baseline) |
+| `total` | Set to `gpu_ms` explicitly so the server does not invent a sum of unrelated keys |
+
+`model` is the checkpoint (`juggernautXL_ragnarok.safetensors`, or the workflow's
+CogVideoX model); `model_parameters` hold steps, cfg, sampler, scheduler,
+width, height, batch size / frames, fps, precision, offload. Seed, theme index,
+attempt, prompt id live in metadata (seed is for reproduction, not a chart dimension).
+
+Per-job metadata:
+
+- **Outcome**: `success`, `timeout`, `comfy_error`, `queue_error`, `no_output`,
+  `upload_error`/`workflow_config_error` (video), `connection_error`,
+  `save_error`, `count_mismatch` (job succeeded but produced the wrong
+  number of images - counted as waste), `exception`. The `phase_at_end`
+  (`queue`/`wait`/`save`) is what separates a lost ComfyUI connection from a
+  local disk failure, because the clients' `requests` errors subclass `OSError`
+  and `generate_node` reports both as "Failed saving ... locally". The error
+  *string returned to the graph is unchanged*; only the trace label is corrected.
+  Failed attempts are `level=ERROR`.
+- **Throughput** (successful jobs): `sec_per_image`, `images_per_min`,
+  `megapixels_per_s`, `sec_per_step`; video: `sec_per_frame`, `frames_per_min`.
+  `warm` / `cached_nodes`: whether ComfyUI reused cached nodes (a cold job includes the checkpoint load).
+- **GPU telemetry** from `nvidia-smi`, sampled every 2 s for the job
+  (independent of ComfyUI's HTTP server, which cannot answer while sampling):
+  `gpu_util_mean_pct`, `gpu_util_low_sample_pct`, `gpu_mem_util_mean_pct`,
+  `gpu_power_mean_w`/`max_w`, `gpu_clock_sm_mean_mhz`, `gpu_clock_ratio`
+  (mean SM clock / max), `gpu_temp_max_c`, `gpu_mem_start/peak/total_mib`,
+  `gpu_throttle_reasons_pct`, `gpu_throttled_sample_pct`, and `gpu_throttle_ms`
+  (cumulative microsecond counters differenced over the job, where the driver
+  reports them). Fields a driver rejects or reports as `[N/A]` are simply
+  absent: `gpu_snapshot()` probes three field sets (full, core, minimal) once
+  and latches the first the installed `nvidia-smi` accepts.
+  `nvidia-smi` utilisation only says a kernel was running, so it reads near
+  100% for any job; it is useful for spotting stalls, not for judging speed.
+  Power, clocks and throttle state are the better performance indicators on a
+  laptop GPU.
+- **Context that explains slow jobs**: `queue_running_at_start` /
+  `queue_pending_at_start` (stale jobs from an earlier timeout), Ollama's
+  resident VRAM at start, free system RAM, ComfyUI version and its own
+  VRAM/RAM view at start and end. ComfyUI's `torch_vram_*` figures are
+  recorded raw because this install uses `cudaMallocAsync`, where they are
+  unlikely to reflect real usage (idle reading was 32 MiB); judge them from
+  real traces before relying on them.
+- **Video workflow facts** read from the exported workflow JSON by class type
+  (not node id): resolution, fps, precision, quantization, offload, and
+  `resize_keep_proportion`. When that is `false` the source image is
+  stretched to the resize node's fixed width x height.
+
+**Waste vs. selection surplus.** `gpu_wasted_s` counts only attempts whose
+output was thrown away (timeouts, errors, count mismatches, and the late real
+cost of abandoned jobs). Candidates that Agent 5 does not pick are *not*
+waste: that is the by-design cost of choosing, reported as `selection_surplus`.
+For video there is no post-generation judge (the review gate precedes it), so
+"kept" means "produced".
+
+**Abandoned jobs.** A client timeout does not stop the job in ComfyUI, so its
+GPU cost is unknown when it times out. `reconcile_abandoned()` runs at the start
+of each attempt and in each graph's `finalize_node`, looks the job up in
+`/history`, and emits a `comfyui.abandoned_job` generation carrying the real
+`gpu_ms` (spans cannot be backdated, so it is a new short observation). The
+time is added to the stage's wasted GPU seconds. A job still running at stage
+end stays in `jobs_unreconciled`. This also records, via
+`produced_after_client_gave_up`, how often a timed-out job produced its images
+anyway.
+
+**Accumulation.** Per-stage totals are held in a `StageUsage` object carried in
+a `ContextVar` next to the active span, never in LangGraph state, so nothing
+here touches checkpoints or the msgpack allow-list. Usage covers the jobs that
+ran *in this process*: a resumed stage reports only the remaining themes.
+
+**Using it in Langfuse.** Chart `usage_details` types (`gpu_ms`, `energy_mwh`,
+`images_produced`) by observation name or model, latency percentiles per
+`comfyui.*` observation, and the scores above per trace. Group a batch with the
+Sessions view. Whether the v4 server's dashboard builder offers custom usage
+types as chartable measures has **not** been confirmed (see Verification).
 
 ### One product is more than one trace
 
@@ -241,7 +360,7 @@ products are joined by URL (the root input), not by trace. See "Deferred".
 sequence runs, so it is the single place the hooks live.
 
 ```
-trace = obs.start_trace(url, run_label)      # defined before the try block
+trace = obs.start_trace(url, run_label, session_id=session_id, product=slug)   # before the try block
 result.trace_id = obs.trace_id(trace)
 
 for each stage:
@@ -273,6 +392,22 @@ Details worth knowing:
   is always false; an already-complete thread simply shows a ~0s duration.
 - **`flush()` runs once per product**, not once per batch, so a crash on
   product 30 doesn't lose products 1-29 sitting in an unsent buffer.
+- **Ctrl-C now closes the trace.** Cancellation arrives inside `run_product`
+  as `asyncio.CancelledError`, which `except Exception` does not catch. A
+  dedicated handler calls `obs.abort_trace(trace, "interrupted")` and re-raises,
+  so the interrupted stage and its finished ComfyUI jobs are exported (root
+  `WARNING`, stage `ERROR`, `completed=0`). A hard kill of the process still
+  loses the in-flight product, and the in-flight ComfyUI attempt's own span
+  (it only ends when the worker thread returns).
+- **`images_kept`** (themes with a non-empty `selected_local_path`) is set on
+  `ProductRunResult` after Agent 5 and passed to `finish_trace` on both the
+  success and failure paths.
+- **`ALLOWED_MSGPACK_MODULES` now includes `ThemeVideoResult`.** The video
+  state holds `ThemeVideoResult` objects directly (`completed_theme_results`,
+  `_pending_result`), so they are serialized on their own; before this they
+  came back from a checkpoint as plain dicts. Nested models (`GeneratedVideo`,
+  `GeneratedImage`) are dumped inside their parent and need no entry. Verified
+  against the installed serializer in the test sandbox only - see Verification.
 
 ## The manifest link (`app/core/manifest.py`)
 
@@ -361,6 +496,45 @@ judgment.
 - `review.py`, end to end in a stand-in project: flagged-only opening,
   `v`, `--open-all`, `--no-open`, a missing selection checkpoint, and
   resume with the last-row-wins approvals file.
+
+**Verified for the ComfyUI usage work (sandbox: Linux, Python 3.12,
+`langfuse==5.0.2`, `langgraph-checkpoint 4.3.1`; fake ComfyUI and fake
+`nvidia-smi`, stubs for the project files that were not available)**
+
+- `usage_details` with custom integer keys, `model_parameters`, metadata and
+  `session_id` serialize as expected on the exported spans.
+- `comfy_job_timing` against a real ComfyUI 0.28.0 `/history` entry captured on
+  the target machine: 144366 ms for 3 images, queue wait 7 ms, nothing cached.
+- **Differential tests**: the original and the instrumented `generate_node`
+  (Agent 4 and Agent 6) return identical dicts across 11 scenarios (success,
+  timeout, ComfyUI error, dropped connection, wrong image count, `/view` failure;
+  video: upload failure, no outputs) in four modes (tracing off, on, Langfuse
+  raising on every call, `nvidia-smi` failing). With tracing off the HTTP
+  requests are identical (no extra traffic); with it on, only `/queue`,
+  `/system_stats` and `/history/<id>` are added. Video `interrupt` counts match.
+- Trace content per failure mode, the stage summary, the span tree
+  (`product` -> `images` -> generations), session propagation, derived scores,
+  reconciliation of a job that timed out and finished later, and the Ctrl-C path,
+  through the real `run_product` with the real image graph.
+- `nvidia-smi` field fallback (full / core / minimal / `[N/A]` / rejected) and
+  value parsing, against a fake that mimics those cases. 40 tests pass.
+- The allow-list: with the old list `ThemeVideoResult` came back as `dict`; with
+  the new list it is a model instance.
+
+**Not verified (needs your machine)**
+
+- Real `nvidia-smi` output on the RTX 3050 Laptop GPU: which of the new fields
+  report values rather than `[N/A]` (power draw and the throttle counters are
+  the likely gaps), and the throttle bit values (from `nvml.h`, from memory).
+- ComfyUI's `/history` for an *interrupted* or *errored* job: the parser expects
+  `execution_interrupted`/`execution_error` messages with timestamps.
+- That the v4 Langfuse UI lets you chart custom `usage_details` keys, and how it
+  treats `total`.
+- The allow-list on your installed `langgraph-checkpoint` version (the sandbox had
+  4.3.1); `tests/obs/test_allowlist.py` prints the result in any environment.
+- Python 3.14, Windows process/subprocess behaviour, and real timings.
+- The stubs stand in for `aspect_ratio`, `utils`, the prompt/selection schemas and the
+  other agents' graphs, so the tests prove the instrumentation, not those modules.
 
 **Not yet confirmed**
 
@@ -453,23 +627,34 @@ of every run.
 
 ## Deliberately deferred (not gaps, decisions)
 
-- **Stage-level granularity only.** The spans mark the six stage
-  boundaries. Inside a stage - Agent 2's model-fallback chain, a
-  retry's `previous_error`, Agent 4/6's per-retry seed draws, individual
-  LLM calls with prompts, token counts and cost - nothing is recorded.
-  Langfuse's LangChain/LangGraph callback integration is the likely route,
-  but note the interaction with a deliberate choice above: the root span
-  is *not* made the ambient context, so callback-created traces would
-  appear as separate traces rather than nested under a stage span, unless
-  trace context is passed explicitly. Not attempted.
-- **A product's batch and video traces aren't linked.** Grouping them
-  under a shared session id is the natural fix; not implemented.
-- **An interrupted run loses that product's trace.** `KeyboardInterrupt`
-  is caught outside `run_product`, so `finish_trace` doesn't run for the
-  product in flight, and an unended span is never exported. Completed
-  products are unaffected (flushed per product).
-- **No cost tracking.** Groq usage, Tavily credits and GPU-hours are still
-  tracked, if at all, locally in each agent.
+- **What is still not recorded inside a stage.** LLM calls and Tavily
+  searches are recorded as `generation`/`tool` observations, and ComfyUI jobs
+  as above. Not recorded: per-node timing and live step progress inside a
+  ComfyUI job (needs ComfyUI's websocket, which may stall like its HTTP server),
+  and per-process GPU memory from the Windows `GPU Process Memory` performance
+  counters (would show Ollama vs ComfyUI and spill into shared memory; needs a
+  probe on your machine first).
+- **Batch and video traces are grouped per command, not per product.**
+  `session_id` is the manifest stem, so a batch and a later video run are two
+  sessions and two traces per product, joined only by URL / `product` metadata.
+- **Hard kills still lose the in-flight product's trace.** Ctrl-C is handled
+  (see above); a killed process is not.
+- **No monetary cost tracking.** GPU seconds and energy (Wh) are recorded for
+  ComfyUI jobs; Groq spend and Tavily credits are not converted to money, and
+  no price is attached to GPU time.
+- **Timeout and cancellation behaviour of ComfyUI jobs is unchanged.** The
+  image client still lets a timed-out job keep running (the video client
+  interrupts it), and the 180 s image timeout is still shorter than a batch.
+  This work only makes those visible (`jobs_timed_out`, `gpu_wasted_s`,
+  `queue_running_at_start`, `comfyui.abandoned_job`). Fixing it - size the
+  timeout to the batch from the recorded `gpu_ms`, and cancel a timed-out job
+  properly (`POST /queue {"delete": [id]}` for pending, `/interrupt` for
+  running) - is a separate step. Cancelling without raising the timeout would
+  make every attempt fail with no output.
+- **`ImageResizeKJ` stretches source frames.** The video workflow's resize
+  node is fixed at 720x480 with `keep_proportion: false`; agent-4 images in
+  other aspect ratios are distorted before animation. Now visible as
+  `resize_keep_proportion=false` on each video job; not changed.
 - **Datasets and experiments aren't used yet.** Scores are being
   collected, which is the prerequisite for the human-evaluation loop -
   a held-out product set scored against a rubric and re-run on every
@@ -513,11 +698,14 @@ of every run.
 
 | File | Role |
 |---|---|
-| `app/core/observability.py` | Langfuse v5 wrapper: `TraceHandle`, stage spans, scores, `startup_check`, no-op behavior |
-| `app/core/pipeline.py` | `run_product()` hooks: trace per product, span per stage, `trace_id` on the result |
+| `observability/observability.py` | Langfuse v5 wrapper: `TraceHandle`, stage spans, scores, `startup_check`, no-op behavior |
+| `app/core/pipeline.py` | `run_product()` hooks: trace per product (session + product slug), span per stage, `trace_id` and `images_kept` on the result, Ctrl-C handler, allow-list incl. `ThemeVideoResult` |
+| `app/agents/image_generation/nodes.py`, `app/agents/video_generation/nodes.py` | `generate_node` wrapped in `obs.comfy_job`; outcome classification; `finalize_node` reconciles abandoned jobs |
+| `app/agents/image_generation/comfyui_client.py` | Added read-only probes `queue_snapshot()`, `system_stats()`, `get_history_entry()` (best-effort, never raise; inherited by the video client). Existing methods unchanged. |
+| `tests/obs/` | Fake ComfyUI, fake `nvidia-smi`, stub overlay, differential / trace-content / unit / integration / allow-list tests |
 | `app/core/manifest.py` | `trace_id` column in the results manifest; `read_manifest_rows()` |
 | `scripts/review.py` | HITL review: shows and opens selected images, writes approvals, scores the trace |
 | `scripts/generate_videos.py` | Approvals gate on `--from-results` without `--rows` |
-| `scripts/run_batch.py` | Prints the tracing status line; passes `run_label="batch"` |
+| `scripts/run_batch.py` | Prints the tracing status line; passes `run_label="batch"` and `session_id=<manifest stem>` |
 | `docker-compose.langfuse.yml` | Official Langfuse v4 stack (Postgres host port removed) |
 | `langfuse.env` | First-boot org/project/user and API key init values |

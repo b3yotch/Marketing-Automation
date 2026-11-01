@@ -20,18 +20,49 @@ generate --> validate --+--> END (valid, or retries exhausted)
 Same shape as Agent 2 - no scrape-equivalent stage, since input is already a
 validated `CreativeDirection` object, not something that can fail to fetch.
 
-1. **generate** (`nodes.py` + `llm.py`) - calls `structured_chat_groq`
-   against `prompt_gen_primary_model`, falling back to
-   `prompt_gen_fallback_model` on any provider failure. Same
-   fallback-vs-retry separation as Agent 2: a provider error isn't a signal
-   the *approach* needs correcting, so it doesn't consume a retry.
-2. **validate** - same low bar as Agents 1 and 2: catches outright failures
-   (wrong number of `prompt_sets`, empty prompt fields), not prompt
+1. **generate** (`nodes.py` + `llm.py`) - `generate_node` makes one
+   `structured_chat_groq` call per input `visual_theme`, all concurrently,
+   each asking for a single `ThemePromptSet`. Every theme independently
+   walks `prompt_gen_primary_model` -> `prompt_gen_fallback_model`, so a
+   provider failure on one theme neither fails the others nor consumes a
+   retry. Same fallback-vs-retry separation as Agent 2: a provider error
+   isn't a signal the *approach* needs correcting, so it doesn't consume a
+   retry.
+2. **validate** - per-theme, same low bar as Agents 1 and 2: catches
+   outright failures (empty `positive_prompt`, `base_prompt` or
+   `motion_description`, a `base_prompt` over the length proxy), not prompt
    *quality*. Deeper judgment belongs to the Review/Critic agent, once it
-   can actually look at what Agent 4 generates from these prompts.
+   can actually look at what Agent 4 generates from these prompts. The
+   number of `prompt_sets` is **not** checked here anymore - it is
+   guaranteed by `generate_node`'s loop over `creative.visual_themes`, not
+   by the model. `source_setting` is overwritten in code with the real
+   theme setting instead of trusted from the model, and the product-level
+   `extraction_confidence` is computed as the minimum of the per-theme
+   values.
 3. **bump_retry** - increments the retry counter and loops back to
-   `generate` if validation failed and retries remain
-   (`max_prompt_gen_retries`, default 2).
+   `generate` if any theme is still missing and retries remain
+   (`max_prompt_gen_retries`, default 2). A failing theme is removed from
+   `theme_sets` and its specific reason recorded in `theme_feedback`, so
+   the next pass re-calls only that theme and appends the reason to its
+   prompt. Provider failures are reported in the final error but never fed
+   back - an API error has nothing actionable to tell the model.
+
+## Testing
+
+The per-theme routing is covered by a mocked test that runs the real graph
+(`prompt_gen_graph.ainvoke`) with `structured_chat_groq` patched out - no
+Groq calls. It covers: 3 themes producing 3 sets; only the failed theme
+being re-called, with its validation reason fed back; a provider failure
+retried with no reason fed back; the fallback model being used when the
+primary raises; a theme that never validates giving up after
+`max_prompt_gen_retries`; and zero themes failing cleanly. What it can't
+prove is real model behavior, so one live 2-3 theme product is still worth
+running before trusting the request-cost change in a batch.
+
+Error messages number themes 1-based (`theme 1`, `theme 2`, ...), matching
+the "theme N of M" wording in the prompt. The internal `theme_sets` /
+`theme_models` / `theme_errors` / `theme_feedback` maps stay 0-based, keyed
+by index into `creative.visual_themes`.
 
 ## Why this agent has its own model settings, not Agent 2's
 
@@ -44,6 +75,12 @@ different skill from ad copywriting - "best at hooks and captions" isn't
 guaranteed to be "best at generation prompts." **This hasn't been validated
 with a real comparison test yet** (see Deliberately Deferred) - the current
 primary is an inherited placeholder, not a chosen model.
+
+One caveat on this settings block: `prompt_gen_max_tokens` is currently not
+read anywhere. `structured_chat_groq` sends `groq_max_tokens` as
+`max_tokens` for every Groq caller, and both happen to be 2048 today, so
+nothing looks broken - but editing the prompt-gen-specific value has no
+effect until that function accepts a per-call cap.
 
 ## Major challenges
 
@@ -74,18 +111,34 @@ describe text/logos/typography in the visual). Settled on one
 existing output rather than invented - avoids creating a second, drifting
 source of creative copy alongside `CreativeDirection`.
 
-### 3. Bundling image + video into one call per product, not two, to conserve request budget
+### 3. One call per visual theme, not one per product - reversing the original request-budget decision
 
-Since this agent needs both image and video prompts, generating them as two
-separate LLM calls per visual theme would double the Groq request count per
-product on top of what Agents 1 and 2 already consume - relevant even at
-small scale, since it's the *number of requests* that hits Groq's free-tier
-ceiling, not token volume (this agent's input, a compact `CreativeDirection`
-JSON object, is nowhere near token-limit territory). `PromptGenerationOutput`
-bundles `image_prompt` + `video_prompt` into the same `ThemePromptSet`, and
-`generate_node` produces every theme's prompt set in a single call per
-product - keeping this agent's request footprint equal to Agent 2's (one
-request per attempt), not double it.
+The first version asked for one response containing exactly N
+`prompt_sets`, one per input `visual_theme`, specifically to keep this
+agent's Groq request count equal to Agent 2's (one request per attempt
+rather than N). That was wrong in practice: on a real product, three
+consecutive attempts returned 2 of the 3 expected sets, and validation gave
+up with `expected 3 prompt_sets (one per visual_theme), got 2 (gave up
+after 2 retries)`. A count mismatch on every attempt is systematic, not a
+fluke - and the output alone couldn't say whether a theme had been merged
+into another, dropped, or cut off by the output-token budget.
+
+`generate_node` now makes one call per theme, concurrently. That addresses
+all three possible causes at once: the count is a property of the loop over
+`creative.visual_themes` rather than something the model has to get right,
+each response is roughly a third the size (less pressure on the output
+budget), and a retry re-calls only the theme that failed instead of
+re-rolling the whole product. Each theme still bundles its image and video
+prompt into one `ThemePromptSet`, so the original bundling rationale still
+holds - this reversal is about splitting by *item*, not by prompt kind.
+
+The trade is real: a 3-theme product now costs 3 requests per attempt
+instead of 1, plus one per retried theme, which matters against Groq's
+free-tier requests/day ceiling. That is acceptable here because the
+previous design's failure mode was a hard pipeline stop, not just extra
+latency, and Agent 2 already costs one request per attempt. If the request
+budget becomes the binding constraint again, revisit the bundling - but
+correctness first while the failure is systematic.
 
 ### 4. A deprecated fallback model was silently masking itself
 
@@ -100,7 +153,11 @@ caught it even if it had. It surfaced by accident during a manual config
 swap that put the deprecated model in the *primary* slot - every run's
 `model_used` field showed the fallback model instead of the configured
 primary, which is the tell that the primary call is failing outright on
-every single attempt, not intermittently.
+every single attempt, not intermittently. With per-theme calls, `model_used`
+is now the comma-joined set of models that actually produced valid themes
+(e.g. `openai/gpt-oss-120b, openai/gpt-oss-20b`), so the same tell appears
+as the fallback name showing up alongside the primary rather than replacing
+it wholesale - a healthy primary should be the only name in that field.
 
 The same dead model string was sitting in Agent 2's `groq_fallback_model`
 too, undetected for the same reason - its primary had simply never needed
@@ -178,6 +235,11 @@ be obvious which without actually checking.
   since Groq now hosts `qwen/qwen3.6-27b`, a plausible candidate given this
   agent's task sits closer to structured translation than Agent 2's more
   open-ended creative writing.
+- **Live confirmation of the per-theme path**: the mocked routing test
+  covers control flow (including provider fallback and the give-up path),
+  but the rework has not had a real Groq run. One 2-3 theme product end to
+  end is worth doing before a batch, and watch the requests/day budget now
+  that each product costs N calls instead of one.
 - **`aspect_ratio` and hook-pairing differentiation across themes**:
   promising in live testing (different ratios and different suggested hooks
   per theme, matching composition rather than defaulting) but only observed
@@ -200,11 +262,13 @@ be obvious which without actually checking.
   design, not after.** The schema shape (checkpoint-agnostic prompt text
   vs. provider-specific parameters) depends entirely on what's on the other
   end - guessing here would have meant redesigning the schema anyway.
-- **When a shared constraint (request budget) applies across multiple
-  related outputs, bundle them into one call rather than splitting by
-  output type.** Image and video prompts are conceptually distinct, but the
-  constraint that matters (Groq requests/day) doesn't care about that
-  distinction - so the schema doesn't split on it either.
+- **Bundle by output type when the constraint is request budget; split by
+  item when the constraint is cardinality.** Image and video prompts stay
+  bundled into one `ThemePromptSet` per theme because the request budget
+  doesn't care about that distinction - but the themes themselves are now
+  separate calls, because asking one response to return exactly N sets let
+  the model merge or drop one. The split point follows the failure mode,
+  not a blanket "fewer requests is better" rule.
 - **A "which path actually executed" field (`model_used`) needs to be
   watched, not just logged.** It's the only thing that surfaced the
   deprecated-model bug - the fallback chain itself was working exactly as

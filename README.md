@@ -183,18 +183,32 @@ generate --> validate --+--> END (valid, or retries exhausted)
 
 Same shape as Agent 2 - no scrape-equivalent stage.
 
-1. **generate** (`nodes.py` + `llm.py`) - calls `structured_chat_groq`
-   against `prompt_gen_primary_model` (**gpt-oss-120b**, an inherited
-   placeholder - not yet validated with its own comparison test, see
-   `Prompt_generation.md`), falling back to `prompt_gen_fallback_model`
-   (**gpt-oss-20b**). Image and video prompts for *all* of a product's
-   visual themes are produced in a single call, not split across multiple
-   calls - keeps this agent's request footprint equal to Agent 2's rather
-   than doubling it (see `Prompt_generation.md` Challenge 3).
-2. **validate** - same low-bar philosophy: checks `prompt_sets` count
-   matches the input's `visual_themes` count and that no prompt field came
-   back empty, not prompt *quality*.
-3. **bump_retry** - same pattern, `max_prompt_gen_retries` (default 2).
+1. **generate** (`nodes.py` + `llm.py`) - one `structured_chat_groq` call
+   **per visual theme**, all launched concurrently and each asking for a
+   single `ThemePromptSet`. Every theme independently walks
+   `prompt_gen_primary_model` (**gpt-oss-120b**, an inherited placeholder -
+   not yet validated with its own comparison test, see
+   `Prompt_generation.md`) -> `prompt_gen_fallback_model`
+   (**gpt-oss-20b**), so a provider failure on one theme neither fails the
+   others nor consumes a retry. The number of sets is therefore a property
+   of the loop over `visual_themes`, not something the model has to get
+   right, and a retry only re-calls the themes that actually failed.
+2. **validate** - per-theme, same low-bar philosophy: empty
+   `positive_prompt`/`base_prompt`/`motion_description` or an oversized
+   `base_prompt` fails that theme, not prompt *quality*. `source_setting`
+   is overwritten in code with the real theme setting instead of trusted
+   from the model, and the product-level `extraction_confidence` is the
+   lowest of the per-theme values. Only a theme that returned bad output
+   gets its reason fed into the retry prompt; a provider failure does not.
+3. **bump_retry** - same pattern, `max_prompt_gen_retries` (default 2),
+   but a retry is now scoped to the missing themes rather than re-rolling
+   the whole product.
+
+This replaced an earlier design where one call had to return exactly N
+`prompt_sets` entries, one per theme. That failed systematically on a real
+product (2 of 3 returned, three attempts in a row), so Agent 3 now spends N
+requests per product instead of one - see `Prompt_generation.md`
+Challenge 3 for the failure and the tradeoff.
 
 Sampler/workflow parameters (seed, steps, cfg_scale, checkpoint/LoRA
 selection) are deliberately **not** modeled in this agent's schema - those
@@ -432,8 +446,9 @@ GROQ_API_KEY=your-key-here
 # Agent 2 - Tavily (cloud, market/competitor research - optional, best-effort)
 TAVILY_API_KEY=your-key-here
 
-# Observability - Langfuse (self-hosted, optional, best-effort). These match
-# the pair defined in langfuse.env; tracing is simply off if they aren't set.
+# Observability - Langfuse (self-hosted, optional, best-effort). Leave these
+# unset to use the bootstrap key pair from observability/langfuse.env; explicit
+# values here win (the rotation path once keys are ever changed).
 LANGFUSE_PUBLIC_KEY=pk-lf-local-creative-workflow
 LANGFUSE_SECRET_KEY=sk-lf-local-creative-workflow
 LANGFUSE_BASE_URL=http://localhost:3000
@@ -486,8 +501,8 @@ pip install aiosqlite langgraph-checkpoint-sqlite
 Groq's free tier is enough to develop against (1K requests/day per model as
 of writing - see `Creative_strategy.md` Challenge 1 for why that's not
 actually the binding constraint it looks like at first, and
-`Prompt_generation.md` Challenge 3 for how Agent 3 avoids doubling its
-request footprint despite generating two prompt types per theme). Worth
+`Prompt_generation.md` Challenge 3 for why Agent 3 now spends N requests
+per product, one per visual theme, instead of one). Worth
 periodically checking your configured model strings (`groq_primary_model`,
 `groq_fallback_model`, `prompt_gen_primary_model`,
 `prompt_gen_fallback_model`) against Groq's current model catalog -
@@ -640,7 +655,7 @@ in a batch to Agent 5's judgment with nobody ever looking at a selected
 image (`--from-results <manifest>` with no `--rows`):
 
 ```bash
-python scripts/review.py outputs/batch_results_<ts>.csv
+python observability/review.py outputs/batch_results_<ts>.csv
 # approve/reject each product, see its below-threshold theme flags
 python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv \
     --approvals outputs/approvals_<ts>.csv
@@ -665,23 +680,62 @@ when you've decided deliberately not to review.
 
 Optional and best-effort - every pipeline run works identically with no
 Langfuse configured at all, tracing just doesn't happen. When
-`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are set, `run_product()`
-opens one trace per product per command invocation, tagged `batch` or
-`video`, with one span per stage (including whether it was a checkpoint
-hit) and trace-level scores for completion status and selection-flag
-count. The trace id is written into the results manifest, which is what
-lets `scripts/review.py` attach a `human_approval` score to the right
-trace from a separate process invocation - no need to keep the original
-trace object alive across the gap between a batch run and its later
-review.
+credentials are available, `run_product()` opens one trace per product
+per command invocation, named `product:batch` or `product:video` and
+grouped into a Langfuse **session** named after the results manifest (a
+batch in the Langfuse UI and its CSV share one name), with one span per
+stage (including whether it was a checkpoint hit) and trace-level scores
+for completion status and selection-flag count. The trace id is written
+into the results manifest, which is what lets `observability/review.py`
+attach a `human_approval` score to the right trace from a separate
+process invocation - no need to keep the original trace object alive
+across the gap between a batch run and its later review.
+
+Credentials resolve from the first-boot bootstrap pair in
+`observability/langfuse.env` unless explicit
+`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are set (in `.env` or the
+shell) - explicit values win, which is the rotation path once the
+database is no longer empty and the init values no longer apply.
 
 ```bash
-docker compose --env-file langfuse.env -f docker-compose.langfuse.yml up -d
-# UI at http://localhost:3000 - log in with the email/password in langfuse.env
+docker compose --env-file observability/langfuse.env -f observability/docker-compose.langfuse.yml up -d
+# UI at http://localhost:3000 - log in with the email/password in observability/langfuse.env
 ```
 
-See `Observability.md` for the full architecture, data model, and a
-module-by-module walkthrough.
+Beyond stage spans, each stage records what happened *inside* it:
+
+- **LLM generations** (`app/core/llm.py`) - every managed model call
+  (Ollama text, Ollama vision for Agent 5, Groq for Agents 2/3) becomes
+  one `generation` observation with model, token usage, finish reason
+  and latency - including the malformed-output/parse failures that
+  would otherwise be invisible.
+- **Tool spans** - each Tavily market/competitor search gets a span;
+  failed searches are still swallowed by the best-effort contract but
+  now appear as `ERROR` spans carrying the exception, instead of leaving
+  no trace at all.
+- **ComfyUI job usage** (Agents 4/6) - every ComfyUI attempt is a
+  `generation` observation carrying a `usage_details` dict a dashboard
+  can sum (diffusion models have no tokens, so usage is defined as GPU
+  time plus work units): ComfyUI's own `gpu_ms` (from `/history`, not
+  client wall clock), queue wait, client-side wait/save phases,
+  images/frames produced, and board energy integrated from `power.draw`.
+  Attempt outcomes are labelled precisely (timeout, ComfyUI error, lost
+  connection, wrong image count) - and a job the client gave up on but
+  that kept running server-side is reconciled later from `/history` and
+  counted as GPU waste (`comfyui.abandoned_job`).
+- **Resource sampling** - while a stage runs, a background thread polls
+  GPU power/clocks/temperature/throttle state and (if `psutil` is
+  installed) system RAM; the peaks land in span metadata, and ComfyUI
+  jobs additionally record per-job telemetry. Derived stage scores
+  (`gpu_s:<stage>`, `gpu_wasted_s:<stage>`, `waste_pct:<stage>`,
+  `energy_wh:<stage>`, `images_kept`, `gpu_s_per_kept_image`) make cost
+  vs. selection-surplus visible per product. Set
+  `OBS_RESOURCE_SAMPLING=0` to disable sampling.
+
+Interrupted runs export too: Ctrl-C calls `abort_trace()` so the
+in-flight product's stage span and finished ComfyUI jobs still reach
+Langfuse. See `observability/observability.md` for the full
+architecture, data model, and a module-by-module walkthrough.
 
 Written against the Langfuse Python SDK **v5** (`langfuse==5.0.2`), which
 is OpenTelemetry-based: there is no trace object (`TraceHandle` wraps the
@@ -689,10 +743,14 @@ root span), and spans can't be backdated, so each stage opens its span
 before running and closes it after. v5 requires **self-hosted Langfuse
 >= 4.59.0** (or Langfuse Cloud) - v2 and v3 servers are unsupported, which
 is why the compose file is the official six-container stack pinned to the
-`:4` images rather than a minimal Postgres-only one. Each script prints a
-one-line `Tracing: on/off` status at startup (`startup_check()`), because
-best-effort tracing otherwise fails silently on a wrong key or an
-unreachable server.
+`:4` images rather than a minimal Postgres-only one. **Langfuse v4 runs
+in `events_only` mode**: trace data lives in ClickHouse (ingested web →
+MinIO → Redis queue → worker), Postgres holds only accounts/projects and
+keys, and the legacy read endpoints are disabled - query the UI or the
+events-based API rather than `GET /api/public/traces`. Each script prints
+a one-line `Tracing: on/off` status at startup (`startup_check()`),
+because best-effort tracing otherwise fails silently on a wrong key or
+an unreachable server.
 
 ## Configuration notes
 
@@ -715,7 +773,8 @@ Worth understanding rather than just accepting the defaults:
 | `max_creative_retries` | 2 | Agent 2's retry budget. |
 | `prompt_gen_primary_model` / `prompt_gen_fallback_model` | `openai/gpt-oss-120b` / `openai/gpt-oss-20b` | Agent 3's model chain - kept as its own settings block, separate from Agent 2's, because prompt-writing for generation models is a different skill from ad copywriting. The primary is an inherited placeholder, not yet validated with its own comparison test - see `Prompt_generation.md`. |
 | `prompt_gen_temperature` | 0.6 | Slightly lower than Agent 2's 0.7 - prompt-writing benefits from more precision/consistency than open-ended ad copy, but still needs some variation across 2-3 distinct visual themes. |
-| `max_prompt_gen_retries` | 2 | Agent 3's retry budget. |
+| `max_prompt_gen_retries` | 2 | Agent 3's retry budget - applied per theme, since only the themes that failed are re-called. |
+| `prompt_gen_max_tokens` | 2048 (**unused**) | Not read anywhere: `structured_chat_groq` sends `groq_max_tokens` as `max_tokens` for every Groq caller. Both are 2048 today, so behavior matches, but changing this one has no effect until `structured_chat_groq` accepts a per-call cap. |
 | `comfyui_checkpoint` | `juggernautXL_ragnarok.safetensors` | Agent 4's SDXL-family checkpoint. |
 | `total_images_per_product` / `max_image_gen_retries` | 5 / 2 | Agent 4's total candidate images (split across themes via `distribute_total()`) and retry budget. |
 | `comfyui_video_num_frames` | 41 | Real runtime parameter, not fixed by the checkpoint - see `Video_generation.md` Challenge 3. Must be `4n+1` for CogVideoX's temporal VAE. |
@@ -731,12 +790,12 @@ Worth understanding rather than just accepting the defaults:
 | File | Responsibility |
 |---|---|
 | `app/core/config.py` | Env-driven settings for all six agents |
-| `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) |
+| `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) - every call is recorded as a Langfuse `generation` with model, usage and latency |
 | `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5, plus the guardrail verdict) |
 | `app/core/langgraph_checkpoint.py` | LangGraph-native resume helper (`run_checkpointed`), used by Agents 4 and 6 |
 | `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; never raises past a stage boundary, returns a `ProductRunResult` instead |
 | `app/core/manifest.py` | `ManifestWriter` (per-row-flushed results CSV) + `read_urls()` (accepts a bare URL or a CSV) |
-| `app/core/observability.py` | Langfuse tracing - one trace/product, one span/stage, no-op if unconfigured |
+| `observability/observability.py` | Langfuse tracing - one trace/product, one span/stage, per-LLM-call generations, Tavily tool spans, ComfyUI job usage + resource sampling; no-op if unconfigured |
 | `app/agents/research_agent/schema.py` | `ProductResearch` output contract + `ScrapedProductData` intermediate shape |
 | `app/agents/research_agent/scraper.py` | Playwright fetch + JSON-LD/OG/text extraction, cost-aware review-scroll escalation |
 | `app/agents/research_agent/prompts.py` | System + user prompt for the extraction call |
@@ -745,15 +804,15 @@ Worth understanding rather than just accepting the defaults:
 | `app/agents/research_agent/graph.py` | Graph assembly |
 | `app/agents/research_agent/guardrails.py` | `check_guardrails()` - page-validity heuristic + Llama Guard 3 classification, called by `pipeline.py` between Agents 1 and 2 (not a graph node) |
 | `app/agents/creative_strategy_agent/schema.py` | `CreativeDirection` output contract + `AudienceAngle`/`VisualTheme` sub-models |
-| `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure) |
+| `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure); each search is a Langfuse tool span, so failures are recorded rather than invisible |
 | `app/agents/creative_strategy_agent/prompts.py` | System + user prompt for the creative-generation call |
 | `app/agents/creative_strategy_agent/state.py` | LangGraph state TypedDict |
 | `app/agents/creative_strategy_agent/nodes.py` | Node functions, model-fallback chain, retry/validation routing |
 | `app/agents/creative_strategy_agent/graph.py` | Graph assembly |
 | `app/agents/prompt_gen_agent/schema.py` | `PromptGenerationOutput` output contract + `ImageGenerationPrompt`/`VideoGenerationPrompt`/`ThemePromptSet` sub-models |
-| `app/agents/prompt_gen_agent/prompts.py` | System + user prompt for the prompt-generation call |
-| `app/agents/prompt_gen_agent/state.py` | LangGraph state TypedDict |
-| `app/agents/prompt_gen_agent/nodes.py` | Node functions, model-fallback chain, retry/validation routing |
+| `app/agents/prompt_gen_agent/prompts.py` | System + user prompt for one visual theme per call, including the other themes' settings (for hook variety) and a per-theme retry reason |
+| `app/agents/prompt_gen_agent/state.py` | LangGraph state TypedDict - per-theme results, models, provider errors and validation feedback |
+| `app/agents/prompt_gen_agent/nodes.py` | Node functions - concurrent per-theme calls, targeted retries, model-fallback chain, per-theme validation |
 | `app/agents/prompt_gen_agent/graph.py` | Graph assembly |
 | `app/agents/image_generation/schema.py` | `ImageGenerationOutput` output contract + `GeneratedImage`/`ThemeGenerationResult` |
 | `app/agents/image_generation/state.py` | LangGraph state TypedDict |
@@ -776,8 +835,8 @@ Worth understanding rather than just accepting the defaults:
 | `scripts/test_full_pipeline_live.py` | Chains all six agents for end-to-end testing, with per-stage early-exit flags and checkpointing |
 | `scripts/run_batch.py` | Bulk (or single-URL) entry point - Agents 1-5, always stops before Video Generation, writes the results manifest |
 | `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, enforces the HITL approvals gate on `--from-results` without `--rows` |
-| `scripts/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
-| `docker-compose.langfuse.yml` + `langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values |
+| `observability/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
+| `observability/docker-compose.langfuse.yml` + `observability/langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values (also the tracing bootstrap keys fallback) |
 | `main.py` | CLI runner for Agent 1, standalone |
 | `Product_research.md` | Agent 1 design narrative - challenges hit, decisions made, why |
 | `Creative_strategy.md` | Agent 2 design narrative - same format |
@@ -831,6 +890,11 @@ Worth understanding rather than just accepting the defaults:
   chosen via a real 2-3 candidate comparison against sample
   `CreativeDirection` inputs. Worth running before trusting it - see
   `Prompt_generation.md`.
+- **Per-theme Prompt Generation path not yet live-tested** (Agent 3): the
+  concurrent per-theme calls and targeted retries are covered by a mocked
+  routing test, but the rework has not had a real Groq run yet. One 2-3
+  theme product end to end is worth doing before a batch, since the request
+  cost is now N per product - see `Prompt_generation.md` Challenge 3.
 - **Image/video aspect ratio mismatch** (Agents 3 & 6): `ImageGenerationPrompt.
   aspect_ratio` is chosen per-theme for social framing (e.g. `4:5`,
   `9:16`), but the confirmed video target
