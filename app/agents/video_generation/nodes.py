@@ -219,6 +219,7 @@ def generate_node(state: VideoGenerationState) -> dict:
             "theme_index": theme_index,
             "attempt": state.get("retries", 0),
             "seed": seed,
+            "timeout_s": settings.comfyui_video_generation_timeout_seconds,
         },
         unit="videos",
         requested=1,
@@ -276,7 +277,9 @@ def generate_node(state: VideoGenerationState) -> dict:
             job.outputs([filename], 1)
         except ComfyUIError as exc:
             outcome = _classify_comfy_error(exc)
-            job.fail(outcome, str(exc), abandoned=(outcome == "timeout"))
+            cancel = getattr(_client, "last_cancel", None) if outcome == "timeout" else None
+            job.set_meta(cancel=cancel)
+            job.fail(outcome, str(exc), abandoned=(outcome == "timeout" and cancel != "dequeued"))
             return {"error": str(exc), "current_seed": None}
         except OSError as exc:
             lost_connection = job.current_phase in ("upload", "queue", "wait")

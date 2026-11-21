@@ -34,6 +34,8 @@ class ComfyUIClient:
     def __init__(self, server: str | None = None):
         self.server = server or settings.comfyui_server
         self.client_id = str(uuid.uuid4())
+        # What cancel_job() did on the most recent timeout (read by the node for tracing).
+        self.last_cancel: str | None = None
 
     def check_checkpoint(self, checkpoint: str) -> None:
         r = requests.get(f"{self.server}/object_info/CheckpointLoaderSimple", timeout=10)
@@ -133,11 +135,20 @@ class ComfyUIClient:
         timeout_seconds = timeout_seconds or settings.comfyui_generation_timeout_seconds
         deadline = time.monotonic() + timeout_seconds
         poll_interval = 1.0
+        self.last_cancel = None
 
         while time.monotonic() < deadline:
-            r = requests.get(f"{self.server}/history/{prompt_id}", timeout=10)
-            r.raise_for_status()
-            history = r.json()
+            try:
+                r = requests.get(f"{self.server}/history/{prompt_id}", timeout=10)
+                r.raise_for_status()
+                history = r.json()
+            except (requests.RequestException, ValueError):
+                # Same reasoning as the video client: ComfyUI cannot answer ANY
+                # request while synchronously blocked on a GPU sampling step, so a
+                # failed poll means "asked at a bad moment", not "the job failed".
+                # Only an explicit error status or the deadline below ends this loop.
+                time.sleep(poll_interval)
+                continue
 
             if prompt_id in history:
                 entry = history[prompt_id]
@@ -160,7 +171,50 @@ class ComfyUIClient:
 
             time.sleep(poll_interval)
 
+        # A client-side timeout does NOT stop the job in ComfyUI. Left alone it keeps
+        # the GPU busy and every retry queues behind it - cancel it (best-effort)
+        # BEFORE raising, so the next attempt starts on an idle GPU.
+        self.last_cancel = self.cancel_job(prompt_id)
         raise ComfyUIError(f"Timed out after {timeout_seconds}s waiting for prompt {prompt_id}")
+
+    @staticmethod
+    def image_timeout_seconds(batch_size: int) -> float:
+        """Wait timeout for an image job of `batch_size` images - see the settings comment."""
+        return max(
+            settings.comfyui_generation_timeout_seconds,
+            settings.comfyui_image_timeout_base_seconds
+            + settings.comfyui_image_timeout_per_image_seconds * batch_size,
+        )
+
+    def cancel_job(self, prompt_id: str, timeout: float = 5.0) -> str:
+        """
+        Best-effort cancel of ONE job. Looks the job up in /queue first so the right
+        thing is done to the right job:
+
+          running  -> POST /interrupt (with the prompt_id; a ComfyUI that ignores the
+                      body interrupts whatever is running, which is this job)
+          pending  -> POST /queue {"delete": [id]}  (a blanket interrupt would kill
+                      the OTHER job that is running while this one waits)
+          neither  -> nothing to do (it finished between the last poll and now)
+
+        If /queue itself cannot be read (server busy), falls back to the old blanket
+        interrupt. Never raises. Returns what was done: "interrupted", "dequeued",
+        "gone", "interrupted_unverified" or "failed".
+        """
+        try:
+            snap = self.queue_snapshot(timeout=timeout)
+            if snap is None:
+                requests.post(f"{self.server}/interrupt", timeout=10)
+                return "interrupted_unverified"
+            if prompt_id in snap["running_ids"]:
+                requests.post(f"{self.server}/interrupt", json={"prompt_id": prompt_id}, timeout=10)
+                return "interrupted"
+            if prompt_id in snap["pending_ids"]:
+                requests.post(f"{self.server}/queue", json={"delete": [prompt_id]}, timeout=10)
+                return "dequeued"
+            return "gone"
+        except Exception:
+            return "failed"
 
     def fetch_image_bytes(self, filename: str, subfolder: str = "", folder_type: str = "output") -> bytes:
         """
@@ -199,8 +253,15 @@ class ComfyUIClient:
             body = r.json()
             running = body.get("queue_running") or []
             pending = body.get("queue_pending") or []
-            ids = [item[1] for item in running if isinstance(item, (list, tuple)) and len(item) > 1]
-            return {"running": len(running), "pending": len(pending), "running_ids": ids}
+            def ids_of(items):
+                return [item[1] for item in items if isinstance(item, (list, tuple)) and len(item) > 1]
+
+            return {
+                "running": len(running),
+                "pending": len(pending),
+                "running_ids": ids_of(running),
+                "pending_ids": ids_of(pending),
+            }
         except Exception:
             return None
 

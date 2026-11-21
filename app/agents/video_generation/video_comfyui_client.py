@@ -210,6 +210,7 @@ class VideoComfyUIClient(_ImageComfyUIClient):
         timeout_seconds = timeout_seconds or settings.comfyui_video_generation_timeout_seconds
         deadline = time.monotonic() + timeout_seconds
         poll_interval = 2.0
+        self.last_cancel = None
 
         while time.monotonic() < deadline:
             try:
@@ -251,5 +252,9 @@ class VideoComfyUIClient(_ImageComfyUIClient):
         # abandoned job and gets a connection reset on its very first
         # request, not a clean failure - see upload_image's docstring for
         # exactly what that looked like in practice.
-        self.interrupt()
+        # (cancel_job() is that same interrupt, but aimed: it checks /queue first, so a job
+        # that already finished is left alone and a still-pending one is dequeued instead
+        # of interrupting some other running job; it falls back to the blanket interrupt
+        # when /queue cannot be read.)
+        self.last_cancel = self.cancel_job(prompt_id)
         raise ComfyUIError(f"Timed out after {timeout_seconds}s waiting for prompt {prompt_id}")
