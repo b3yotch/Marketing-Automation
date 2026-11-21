@@ -45,8 +45,17 @@ class CreativeDirection(BaseModel):
 
     source_url: str
 
+    # Required (no default) on purpose. With a default, the field is optional in
+    # the JSON Schema handed to Groq, and a real gpt-oss-120b run returned a
+    # complete, valid object that simply ended after visual_themes - hooks and
+    # captions omitted - because nothing forced it to emit them. Pydantic then
+    # filled in [], validate_node rejected it, and the fallback model was never
+    # tried (no exception was raised). Required + min_length=1 makes a missing or
+    # empty value a ValidationError, which structured_chat_groq wraps as
+    # LLMExtractionError and generate_node handles by trying the fallback model.
     hooks: list[str] = Field(
-        default_factory=list,
+        ...,
+        min_length=1,
         description="3-5 distinct scroll-stopping opening hooks for video/image ads. Each must take a genuinely different angle (pain point, social proof, curiosity, bold claim) - not restatements of the same idea.",
     )
     audience_angles: list[AudienceAngle] = Field(
@@ -58,7 +67,8 @@ class CreativeDirection(BaseModel):
         description="2-3 concrete visual directions for imagery/video generation downstream.",
     )
     captions: list[str] = Field(
-        default_factory=list,
+        ...,
+        min_length=1,
         description="3-5 short-form captions ready to pair with a post, each under 150 characters.",
     )
     messaging_notes: str = Field(

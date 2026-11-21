@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     comfyui_scheduler: str = "karras"
     comfyui_batch_size: int = 5
     comfyui_generation_timeout_seconds: float = 180.0
+    # The wait timeout for an image job is sized to its batch instead of being one
+    # fixed number: max(comfyui_generation_timeout_seconds above, base + per_image *
+    # batch_size). Starting values come from only a handful of observations (a
+    # 3-image batch took ~144s in one traced run and ~190-250s in earlier runs) and
+    # are deliberately generous. Re-derive them from the recorded `gpu_ms` (p95
+    # seconds per image, plus cold checkpoint-load time) once a few real batches
+    # are in Langfuse. A timed-out job is now cancelled in ComfyUI, so a timeout
+    # that is too tight costs the whole attempt rather than just wasting a result.
+    comfyui_image_timeout_base_seconds: float = 60.0
+    comfyui_image_timeout_per_image_seconds: float = 90.0
     total_images_per_product: int = 5
     image_output_dir: str = "outputs/generated_images"
     max_image_gen_retries: int = 2

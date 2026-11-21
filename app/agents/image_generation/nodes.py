@@ -143,6 +143,7 @@ def generate_node(state: ImageGenerationState) -> dict:
     )
 
     steps = settings.comfyui_steps
+    timeout_s = _client.image_timeout_seconds(batch_size)
     start = None
     with obs.comfy_job(
         kind="image",
@@ -167,6 +168,7 @@ def generate_node(state: ImageGenerationState) -> dict:
             "attempt": state.get("retries", 0),
             "seed": seed,
             "aspect_ratio": theme.image_prompt.aspect_ratio,
+            "timeout_s": timeout_s,
         },
         unit="images",
         requested=batch_size,
@@ -188,7 +190,7 @@ def generate_node(state: ImageGenerationState) -> dict:
             job.phase("queue")
             prompt_id = _client.queue_prompt(workflow)
             job.submitted(prompt_id)
-            history_entry = _client.wait_for_completion(prompt_id)
+            history_entry = _client.wait_for_completion(prompt_id, timeout_seconds=timeout_s)
             job.completed(history_entry)
             raw_images = _client.extract_images(history_entry)
             saved_images = _save_images_locally(
@@ -209,7 +211,11 @@ def generate_node(state: ImageGenerationState) -> dict:
             # reason the moment it happens" pattern as Agents 1-3's
             # validate_node, not deferred until retries are exhausted.
             outcome = _classify_comfy_error(exc)
-            job.fail(outcome, str(exc), abandoned=(outcome == "timeout"))
+            # On a timeout the client has already tried to cancel the job; record what it
+            # did. A job that was only dequeued never ran (0 GPU time, nothing to reconcile).
+            cancel = getattr(_client, "last_cancel", None) if outcome == "timeout" else None
+            job.set_meta(cancel=cancel)
+            job.fail(outcome, str(exc), abandoned=(outcome == "timeout" and cancel != "dequeued"))
             return {"error": str(exc), "current_seed": None}
         except OSError as exc:
             # Local disk write failure (permissions, disk full) - distinct from

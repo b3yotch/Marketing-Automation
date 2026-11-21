@@ -229,7 +229,7 @@ Names: `research`, `creative`, `prompts`, `images`, `selection`, `videos`.
 | Duration | Real wall-clock for a stage that ran; ~0 for a checkpoint hit |
 | Metadata | `cached` (bool), `elapsed_seconds` (the stage's compute time - for a cache hit, the *original* time from the checkpoint's metadata) |
 | Output | `{"ok": bool, ...extras}` |
-| Extras | `model_used` (creative: one model; prompts: comma-joined set of the per-theme models that succeeded); `total_images`, `themes` (images); `videos_generated` (videos) |
+| Extras | `model_used` (creative, prompts); `total_images`, `themes` (images); `videos_generated` (videos) |
 | `comfy` metadata | For `images`/`videos` stages that ran ComfyUI jobs in this process: the stage's usage summary (jobs, ok/timed-out/failed, GPU seconds, wasted GPU seconds, waste %, retries, energy, duty cycle, unreconciled jobs). Absent when the stage ran no jobs (e.g. a thread that was already complete), so zero jobs is not a failure. |
 | Level | `DEFAULT` on success, `ERROR` on failure, with the error text as `status_message` |
 
@@ -325,15 +325,46 @@ waste: that is the by-design cost of choosing, reported as `selection_surplus`.
 For video there is no post-generation judge (the review gate precedes it), so
 "kept" means "produced".
 
-**Abandoned jobs.** A client timeout does not stop the job in ComfyUI, so its
-GPU cost is unknown when it times out. `reconcile_abandoned()` runs at the start
+**Abandoned jobs.** A client timeout used to leave the job running in ComfyUI
+(it is now cancelled - see "Timeouts and cancellation" below), so its GPU cost
+is unknown at the moment of the timeout. `reconcile_abandoned()` runs at the start
 of each attempt and in each graph's `finalize_node`, looks the job up in
 `/history`, and emits a `comfyui.abandoned_job` generation carrying the real
 `gpu_ms` (spans cannot be backdated, so it is a new short observation). The
 time is added to the stage's wasted GPU seconds. A job still running at stage
 end stays in `jobs_unreconciled`. This also records, via
 `produced_after_client_gave_up`, how often a timed-out job produced its images
-anyway.
+anyway (now expected to be false, since the job is interrupted). A job that
+was only dequeued never ran and is not reconciled.
+
+**Timeouts and cancellation.** Three changes to the ComfyUI clients, in
+`comfyui_client.py` and `video_comfyui_client.py`; the error strings the graph
+receives are unchanged.
+
+- **The image timeout is sized to the batch**: `max(comfyui_generation_timeout_seconds,
+  comfyui_image_timeout_base_seconds + comfyui_image_timeout_per_image_seconds x batch_size)`
+  with defaults 180 / 60 / 90 s, i.e. 240 s for 2 images, 330 s for 3, 510 s for 5. The
+  old fixed 180 s was below an observed 190-250 s batch, so the first attempt of every
+  theme could time out. The starting values come from three observations (144 s for 3
+  images in one traced run, 190-250 s in earlier runs) and are deliberately generous;
+  re-derive them from the recorded `gpu_ms` (p95 per image, plus cold checkpoint
+  load) once real batches are in Langfuse. The timeout used is recorded as `timeout_s`.
+- **A timed-out job is cancelled before the error is raised**, by `cancel_job()`: it
+  reads `/queue` and then interrupts a *running* job (`POST /interrupt`, sending the
+  `prompt_id`), dequeues a *pending* one (`POST /queue {"delete": [id]}`), and leaves a
+  finished one alone. A blanket interrupt would kill whatever else is running while
+  this job waits. If `/queue` cannot be read it falls back to the old blanket
+  interrupt; it never raises. The result (`interrupted`, `dequeued`, `gone`,
+  `interrupted_unverified`, `failed`) is recorded as `cancel` on the job. The video
+  client now uses the same targeted cancel instead of its blanket interrupt.
+- **Failed polls no longer fail the job.** The image client used to raise on the first
+  failed `/history` poll (the video client already retried). ComfyUI cannot answer
+  while blocked on a GPU step, so a failed poll meant "asked at a bad moment", yet the
+  attempt was failed and the job kept running. Polls are now retried until the job
+  reports or the deadline passes; only an explicit error status ends the wait early.
+
+Together these are what make "one job at a time per GPU" true: releasing a GPU lock
+is only meaningful if the job behind it has actually stopped.
 
 **Accumulation.** Per-stage totals are held in a `StageUsage` object carried in
 a `ContextVar` next to the active span, never in LangGraph state, so nothing
@@ -521,7 +552,34 @@ judgment.
 - The allow-list: with the old list `ThemeVideoResult` came back as `dict`; with
   the new list it is a model instance.
 
+**Verified for the timeout/cancel change (same sandbox, fake ComfyUI that mimics
+queue semantics: first unfinished prompt running, the rest pending)**
+
+- A timed-out running job is interrupted with its `prompt_id`; a pending job is
+  dequeued and the running job behind which it waited is left alone; a finished job
+  is left alone; an unreadable `/queue` falls back to the blanket interrupt; a down
+  server never makes `cancel_job` raise; the timeout error string is unchanged.
+- Failed polls are retried (a job that drops its first two polls now completes);
+  a reported ComfyUI error still fails fast and cancels nothing.
+- The sized timeout (240 / 330 / 510 s for 2 / 3 / 5 images, floor respected).
+- Through the real `run_product`: the interrupted job's real cost (~2 s in the
+  fake) is reconciled into `gpu_wasted_s` instead of a full batch's worth, and
+  `produced_after_client_gave_up` is false.
+- The differential suite still shows identical behaviour for every scenario
+  except the three changed on purpose (image timeout and video timeout add
+  `/queue` + `/interrupt` traffic; an image dropped connection is now retried
+  until the deadline), whose new behaviour is asserted separately. 55 tests pass.
+
 **Not verified (needs your machine)**
+
+- Whether ComfyUI 0.28.0's `/interrupt` honours a `prompt_id` in the body (if it
+  ignores it, it interrupts whatever is running, which is the same job in the
+  normal single-client case), and whether `{"delete": [...]}` on `/queue` works as
+  assumed.
+- What `/history` contains for an interrupted job. The reconciler expects an
+  `execution_interrupted` message with a timestamp; if ComfyUI writes no entry,
+  such jobs stay in `jobs_unreconciled` rather than getting a real `gpu_ms`.
+- That the sized timeout is right for your card (see above).
 
 - Real `nvidia-smi` output on the RTX 3050 Laptop GPU: which of the new fields
   report values rather than `[N/A]` (power draw and the throttle counters are
@@ -642,15 +700,13 @@ of every run.
 - **No monetary cost tracking.** GPU seconds and energy (Wh) are recorded for
   ComfyUI jobs; Groq spend and Tavily credits are not converted to money, and
   no price is attached to GPU time.
-- **Timeout and cancellation behaviour of ComfyUI jobs is unchanged.** The
-  image client still lets a timed-out job keep running (the video client
-  interrupts it), and the 180 s image timeout is still shorter than a batch.
-  This work only makes those visible (`jobs_timed_out`, `gpu_wasted_s`,
-  `queue_running_at_start`, `comfyui.abandoned_job`). Fixing it - size the
-  timeout to the batch from the recorded `gpu_ms`, and cancel a timed-out job
-  properly (`POST /queue {"delete": [id]}` for pending, `/interrupt` for
-  running) - is a separate step. Cancelling without raising the timeout would
-  make every attempt fail with no output.
+- **Timeout values are starting guesses.** The sized image timeout and the
+  cancel-on-timeout behaviour are implemented (see "Timeouts and cancellation"),
+  but the 60 s + 90 s/image numbers rest on three observations. If they are too
+  tight, an attempt now fails outright (the job is cancelled) instead of just
+  wasting its result, so tune them from `gpu_ms` after a few real batches. How a
+  real ComfyUI 0.28.0 records an interrupted or dequeued job in `/history`, and
+  whether its `/interrupt` honours a `prompt_id`, are unverified (below).
 - **`ImageResizeKJ` stretches source frames.** The video workflow's resize
   node is fixed at 720x480 with `keep_proportion: false`; agent-4 images in
   other aspect ratios are distorted before animation. Now visible as
@@ -701,7 +757,9 @@ of every run.
 | `observability/observability.py` | Langfuse v5 wrapper: `TraceHandle`, stage spans, scores, `startup_check`, no-op behavior |
 | `app/core/pipeline.py` | `run_product()` hooks: trace per product (session + product slug), span per stage, `trace_id` and `images_kept` on the result, Ctrl-C handler, allow-list incl. `ThemeVideoResult` |
 | `app/agents/image_generation/nodes.py`, `app/agents/video_generation/nodes.py` | `generate_node` wrapped in `obs.comfy_job`; outcome classification; `finalize_node` reconciles abandoned jobs |
-| `app/agents/image_generation/comfyui_client.py` | Added read-only probes `queue_snapshot()`, `system_stats()`, `get_history_entry()` (best-effort, never raise; inherited by the video client). Existing methods unchanged. |
+| `app/agents/image_generation/comfyui_client.py` | Read-only probes `queue_snapshot()`, `system_stats()`, `get_history_entry()` (best-effort, never raise; inherited by the video client); `cancel_job()` and `image_timeout_seconds()`; `wait_for_completion` retries failed polls and cancels the job on timeout. |
+| `app/agents/video_generation/video_comfyui_client.py` | On timeout uses the targeted `cancel_job()` instead of a blanket interrupt. |
+| `app/core/config.py` | Added `comfyui_image_timeout_base_seconds` / `comfyui_image_timeout_per_image_seconds`. |
 | `tests/obs/` | Fake ComfyUI, fake `nvidia-smi`, stub overlay, differential / trace-content / unit / integration / allow-list tests |
 | `app/core/manifest.py` | `trace_id` column in the results manifest; `read_manifest_rows()` |
 | `scripts/review.py` | HITL review: shows and opens selected images, writes approvals, scores the trace |

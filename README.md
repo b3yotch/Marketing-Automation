@@ -35,6 +35,14 @@ and a separate video command that spends Agent 6's ~33 minutes/product
 only against whichever subset you pick after reviewing what Agent 5
 selected.
 
+Two cross-cutting layers sit around the agents rather than inside them: a
+**guardrail gate** between Agents 1 and 2 (see "Guardrails" below) that
+blocks unusable or unsafe products before any generation cost is paid, and
+**Langfuse observability** (see "Observability" below), including usage
+tracking for the two local diffusion models, since "usage" for a model with
+no tokens has to be defined (GPU time, throughput, waste) rather than read
+off an API response.
+
 Each agent is a self-contained LangGraph subgraph living in its own
 `app/agents/<name>/` folder (`schema.py`, `prompts.py`, `state.py`,
 `nodes.py`, `graph.py`), sharing common infrastructure in `app/core/` -
@@ -96,6 +104,43 @@ answering from training knowledge. The one genuinely interpretive field is
 `brand_positioning`. The same local model (`qwen3.5:4b`) later turned out
 to be natively multimodal too, which is what Agent 5 ended up running its
 vision judgment on - see `Image_selection.md` Challenge 7.
+
+## Guardrails: page validity + Llama Guard (gate between Agents 1 and 2)
+
+Not an agent and not a graph node: `run_product()` calls `check_guardrails()`
+(`app/agents/research_agent/guardrails.py`) directly between stage 1 and
+stage 2. Nothing downstream is reachable without passing it - a product that
+fails is reported with `status="blocked"` and never reaches Creative
+Strategy, Prompt Generation, Image Generation, Image Selection, or Video, so
+no Groq calls, GPU time or review attention are spent on it.
+
+Two verdicts, checked in order, plus a fail-closed case:
+
+| `guardrail_blocked_by` | Meaning |
+|---|---|
+| `invalid_page` | Agent 1's self-reported extraction confidence is below `min_valid_extraction_confidence` (0.4) - the page was probably not a product page, or the scrape returned junk. Llama Guard is not even called. |
+| `unsafe` | Llama Guard 3 (`llama_guard_model`, default `llama-guard3:1b`, local via Ollama) classified the product content as unsafe. Its native `safe` / `unsafe` + category-code reply is parsed directly, not through the project's JSON-schema prompting. |
+| `guard_error` | The check could not run at all (Ollama unreachable, unparseable verdict). The gate **fails closed**: the product is blocked rather than waved through unchecked. |
+
+Behaviours worth knowing before touching it:
+
+- **It is not a stage.** It is not in `STAGE_ORDER`, so `--stop-after
+  research` legitimately skips it (no point spending a model call when
+  creative will not run).
+- **The verdict is checkpointed** on its own (flat JSON, `guardrails`), so a
+  resumed batch does not call Llama Guard twice for the same product.
+  A `guard_error` is deliberately **not** persisted: it is an infrastructure
+  failure worth retrying on the next run, not a property of the product -
+  caching it would keep blocking the product until `--fresh`.
+- **"Blocked" is an expected outcome, not a failure.** `ProductRunResult`
+  carries `status="blocked"`, `guardrail_blocked_by`, `guardrail_reason`, and
+  `stage_reached="research"`; the batch and video summaries list blocked
+  products in their own section ("not pipeline failures"), and a blocked row
+  is never offered for review or video (`review.py` walks `status=ok` rows
+  only).
+- **It is traced.** The gate has its own `guardrails` stage span (ok flag,
+  `blocked_by` in the output, the reason as the error), cache hits are
+  marked, and a blocked product's trace ends with status `blocked`.
 
 ## Agent 2: Creative Strategy
 
@@ -183,32 +228,18 @@ generate --> validate --+--> END (valid, or retries exhausted)
 
 Same shape as Agent 2 - no scrape-equivalent stage.
 
-1. **generate** (`nodes.py` + `llm.py`) - one `structured_chat_groq` call
-   **per visual theme**, all launched concurrently and each asking for a
-   single `ThemePromptSet`. Every theme independently walks
-   `prompt_gen_primary_model` (**gpt-oss-120b**, an inherited placeholder -
-   not yet validated with its own comparison test, see
-   `Prompt_generation.md`) -> `prompt_gen_fallback_model`
-   (**gpt-oss-20b**), so a provider failure on one theme neither fails the
-   others nor consumes a retry. The number of sets is therefore a property
-   of the loop over `visual_themes`, not something the model has to get
-   right, and a retry only re-calls the themes that actually failed.
-2. **validate** - per-theme, same low-bar philosophy: empty
-   `positive_prompt`/`base_prompt`/`motion_description` or an oversized
-   `base_prompt` fails that theme, not prompt *quality*. `source_setting`
-   is overwritten in code with the real theme setting instead of trusted
-   from the model, and the product-level `extraction_confidence` is the
-   lowest of the per-theme values. Only a theme that returned bad output
-   gets its reason fed into the retry prompt; a provider failure does not.
-3. **bump_retry** - same pattern, `max_prompt_gen_retries` (default 2),
-   but a retry is now scoped to the missing themes rather than re-rolling
-   the whole product.
-
-This replaced an earlier design where one call had to return exactly N
-`prompt_sets` entries, one per theme. That failed systematically on a real
-product (2 of 3 returned, three attempts in a row), so Agent 3 now spends N
-requests per product instead of one - see `Prompt_generation.md`
-Challenge 3 for the failure and the tradeoff.
+1. **generate** (`nodes.py` + `llm.py`) - calls `structured_chat_groq`
+   against `prompt_gen_primary_model` (**gpt-oss-120b**, an inherited
+   placeholder - not yet validated with its own comparison test, see
+   `Prompt_generation.md`), falling back to `prompt_gen_fallback_model`
+   (**gpt-oss-20b**). Image and video prompts for *all* of a product's
+   visual themes are produced in a single call, not split across multiple
+   calls - keeps this agent's request footprint equal to Agent 2's rather
+   than doubling it (see `Prompt_generation.md` Challenge 3).
+2. **validate** - same low-bar philosophy: checks `prompt_sets` count
+   matches the input's `visual_themes` count and that no prompt field came
+   back empty, not prompt *quality*.
+3. **bump_retry** - same pattern, `max_prompt_gen_retries` (default 2).
 
 Sampler/workflow parameters (seed, steps, cfg_scale, checkpoint/LoRA
 selection) are deliberately **not** modeled in this agent's schema - those
@@ -297,6 +328,12 @@ preemptively in both Agent 5's and Agent 6's state.
 `checkpointer` at compile time, used by the pipeline runner for real
 mid-loop resume (a crash on theme 3 of 5 doesn't mean redoing themes 1-2)
 - see "Checkpointing" below.
+
+**Usage tracking:** every `generate_node` attempt is one traced ComfyUI job
+(GPU time, throughput, queue wait, outcome, retry waste) - see "What is
+recorded for the local image and video models" under Observability. This is
+instrumentation only: the node returns exactly what it returned before, and
+a Langfuse or `nvidia-smi` failure cannot change that.
 
 ## Agent 5: Image Selection (Critic)
 
@@ -398,6 +435,11 @@ for real mid-loop resume, given this agent's real measured cost (up to
 ~4500s per attempt; ~1964s for an actual 2-video run) - see
 "Checkpointing" below.
 
+**Usage tracking:** same as Agent 4 - each attempt is a traced job. It also
+records facts that live in the exported workflow JSON rather than in
+`Settings` (resolution, fps, precision, offload), read by node class type so
+they do not depend on node ids.
+
 ## Checkpointing
 
 Two different mechanisms, used for different stages on purpose - they
@@ -408,7 +450,8 @@ answer different questions and neither is a strict upgrade of the other:
   succeeds. Used for Agents 1, 2, 3, and 5 - fast, single-shot stages
   where the only question worth asking is "did this whole stage already
   finish." A crash mid-stage means redoing that stage from zero, which is
-  cheap for these four.
+  cheap for these four. The guardrail verdict is checkpointed the same way
+  (except a `guard_error`, which is never persisted - see "Guardrails").
 - **`app/core/langgraph_checkpoint.py`** - wraps LangGraph's own
   checkpointer (`AsyncSqliteSaver`), used for Agents 4 and 6 specifically,
   the two stages where a partial loss is actually expensive (image
@@ -418,6 +461,11 @@ answer different questions and neither is a strict upgrade of the other:
   can't express. `run_checkpointed()` picks between three outcomes (never
   started / partway through / already finished) by reading
   `graph.aget_state(config)`, not just two.
+  The state is serialized with an explicit msgpack allow-list
+  (`ALLOWED_MSGPACK_MODULES` in `pipeline.py`); a model type that is not on
+  it comes back from a checkpoint as a plain dict. The list now includes
+  `ThemeVideoResult` (Agent 6's per-theme result, held directly in its
+  state), which was missing.
 
 Both are keyed by the product URL (slugified), not a run ID, so re-running
 the same command against the same URL always resumes rather than
@@ -446,12 +494,17 @@ GROQ_API_KEY=your-key-here
 # Agent 2 - Tavily (cloud, market/competitor research - optional, best-effort)
 TAVILY_API_KEY=your-key-here
 
-# Observability - Langfuse (self-hosted, optional, best-effort). Leave these
-# unset to use the bootstrap key pair from observability/langfuse.env; explicit
-# values here win (the rotation path once keys are ever changed).
+# Observability - Langfuse (self-hosted, optional, best-effort). These match
+# the pair defined in langfuse.env; tracing is simply off if they aren't set.
 LANGFUSE_PUBLIC_KEY=pk-lf-local-creative-workflow
 LANGFUSE_SECRET_KEY=sk-lf-local-creative-workflow
 LANGFUSE_BASE_URL=http://localhost:3000
+
+# Observability tuning (all optional)
+# OBS_RESOURCE_SAMPLING=0              # turn off all nvidia-smi / RAM sampling
+# OBS_SAMPLE_INTERVAL_SECONDS=3        # stage-level memory sampling
+# OBS_JOB_SAMPLE_INTERVAL_SECONDS=2    # per-ComfyUI-job GPU sampling
+# OBS_MAX_TEXT_CHARS=15000             # truncation for prompts/outputs stored on traces
 
 # Agents 4 & 6 - ComfyUI (local)
 COMFYUI_SERVER=http://127.0.0.1:8188
@@ -468,6 +521,15 @@ Challenge 7):
 ```bash
 ollama show qwen3.5:4b   # look for "vision" under Capabilities
 ```
+
+**Guardrails** need a Llama Guard checkpoint pulled locally -
+`ollama pull llama-guard3:1b` (or whatever `llama_guard_model` points at).
+If it is missing or Ollama is down, products are blocked as `guard_error`
+(fail closed) rather than passed unchecked.
+
+**GPU usage tracking** (optional) uses `nvidia-smi`, which ships with the
+NVIDIA driver and needs to be on `PATH`; without it the GPU telemetry fields
+are simply absent and everything else still records.
 
 **Agent 4** needs a local ComfyUI instance running with the
 `juggernautXL_ragnarok.safetensors` checkpoint (or whatever
@@ -501,8 +563,8 @@ pip install aiosqlite langgraph-checkpoint-sqlite
 Groq's free tier is enough to develop against (1K requests/day per model as
 of writing - see `Creative_strategy.md` Challenge 1 for why that's not
 actually the binding constraint it looks like at first, and
-`Prompt_generation.md` Challenge 3 for why Agent 3 now spends N requests
-per product, one per visual theme, instead of one). Worth
+`Prompt_generation.md` Challenge 3 for how Agent 3 avoids doubling its
+request footprint despite generating two prompt types per theme). Worth
 periodically checking your configured model strings (`groq_primary_model`,
 `groq_fallback_model`, `prompt_gen_primary_model`,
 `prompt_gen_fallback_model`) against Groq's current model catalog -
@@ -620,6 +682,12 @@ reviewable artifact - selected images plus a flag for any theme Agent 5
 selected below its confidence threshold - and `generate_videos.py` spends
 the expensive stage only where that review says it's worth it.
 
+**Summaries separate the three outcomes.** Both commands print blocked
+products ("not pipeline failures"), failures, and - for video runs - products
+that completed with zero videos in their own sections. Each product's trace
+is grouped into a Langfuse session named after the manifest file, so a batch
+in Langfuse and its results CSV share a name (see Observability).
+
 **Failure isolation is per-row, with no separate retry mechanism**, on
 purpose: `run_product()` (`app/core/pipeline.py`) never raises past a
 stage boundary and never exits, so one bad URL costs that row and nothing
@@ -636,7 +704,9 @@ leaves a readable record of everything that finished. Columns: `url`,
 `selection_flags` (which themes came back `selected_below_threshold` -
 the signal worth sorting by before deciding what to animate),
 `videos_generated` (blank on a batch-only run), `elapsed_seconds`,
-`finished_at`.
+`finished_at`, and `trace_id` (the Langfuse trace, blank when tracing is
+off). `status` is `ok`, `failed`, or `blocked` (stopped by the guardrail
+gate - an unsuitable product, not a broken run).
 
 **Sequential, deliberately, with no concurrency across products.** Through
 Agent 5, roughly 97% of a product's time is GPU/local-model-bound (Agents
@@ -655,7 +725,7 @@ in a batch to Agent 5's judgment with nobody ever looking at a selected
 image (`--from-results <manifest>` with no `--rows`):
 
 ```bash
-python observability/review.py outputs/batch_results_<ts>.csv
+python scripts/review.py outputs/batch_results_<ts>.csv
 # approve/reject each product, see its below-threshold theme flags
 python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv \
     --approvals outputs/approvals_<ts>.csv
@@ -679,63 +749,39 @@ when you've decided deliberately not to review.
 ### Observability (Langfuse)
 
 Optional and best-effort - every pipeline run works identically with no
-Langfuse configured at all, tracing just doesn't happen. When
-credentials are available, `run_product()` opens one trace per product
-per command invocation, named `product:batch` or `product:video` and
-grouped into a Langfuse **session** named after the results manifest (a
-batch in the Langfuse UI and its CSV share one name), with one span per
-stage (including whether it was a checkpoint hit) and trace-level scores
-for completion status and selection-flag count. The trace id is written
-into the results manifest, which is what lets `observability/review.py`
-attach a `human_approval` score to the right trace from a separate
-process invocation - no need to keep the original trace object alive
-across the gap between a batch run and its later review.
+Langfuse configured at all, tracing just doesn't happen, and tracing can
+never raise into a run. When `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are
+set, `run_product()` opens one trace per product per command invocation,
+tagged `batch` or `video`, carrying:
 
-Credentials resolve from the first-boot bootstrap pair in
-`observability/langfuse.env` unless explicit
-`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are set (in `.env` or the
-shell) - explicit values win, which is the rotation path once the
-database is no longer empty and the init values no longer apply.
+- **a session** named after the manifest file (`batch_results_<ts>`,
+  `video_results_<ts>`), so everything one command processed is grouped in
+  Langfuse's Sessions view and shares a name with its results CSV, and the
+  product slug in trace metadata for per-product filtering;
+- **one span per stage** (research, guardrails, creative, prompts, images,
+  selection, videos), including whether it was a checkpoint hit and, per
+  stage, sampled GPU/RAM memory;
+- **child observations inside a stage**: LLM calls as generations, Tavily
+  searches as tool spans, and every ComfyUI job as a generation with GPU
+  usage (next section);
+- **trace-level scores** for completion status, selection-flag count, GPU
+  usage and waste.
+
+The trace id is written into the results manifest, which is what lets
+`scripts/review.py` attach a `human_approval` score to the right trace from a
+separate process invocation - no need to keep the original trace object alive
+across the gap between a batch run and its later review. **Ctrl-C closes the
+in-flight trace** (the interrupted stage and its finished ComfyUI jobs are
+exported with status `interrupted`) instead of silently losing it; a hard
+kill of the process still loses the in-flight product.
 
 ```bash
 docker compose --env-file observability/langfuse.env -f observability/docker-compose.langfuse.yml up -d
-# UI at http://localhost:3000 - log in with the email/password in observability/langfuse.env
+# UI at http://localhost:3000 - log in with the email/password in langfuse.env
 ```
 
-Beyond stage spans, each stage records what happened *inside* it:
-
-- **LLM generations** (`app/core/llm.py`) - every managed model call
-  (Ollama text, Ollama vision for Agent 5, Groq for Agents 2/3) becomes
-  one `generation` observation with model, token usage, finish reason
-  and latency - including the malformed-output/parse failures that
-  would otherwise be invisible.
-- **Tool spans** - each Tavily market/competitor search gets a span;
-  failed searches are still swallowed by the best-effort contract but
-  now appear as `ERROR` spans carrying the exception, instead of leaving
-  no trace at all.
-- **ComfyUI job usage** (Agents 4/6) - every ComfyUI attempt is a
-  `generation` observation carrying a `usage_details` dict a dashboard
-  can sum (diffusion models have no tokens, so usage is defined as GPU
-  time plus work units): ComfyUI's own `gpu_ms` (from `/history`, not
-  client wall clock), queue wait, client-side wait/save phases,
-  images/frames produced, and board energy integrated from `power.draw`.
-  Attempt outcomes are labelled precisely (timeout, ComfyUI error, lost
-  connection, wrong image count) - and a job the client gave up on but
-  that kept running server-side is reconciled later from `/history` and
-  counted as GPU waste (`comfyui.abandoned_job`).
-- **Resource sampling** - while a stage runs, a background thread polls
-  GPU power/clocks/temperature/throttle state and (if `psutil` is
-  installed) system RAM; the peaks land in span metadata, and ComfyUI
-  jobs additionally record per-job telemetry. Derived stage scores
-  (`gpu_s:<stage>`, `gpu_wasted_s:<stage>`, `waste_pct:<stage>`,
-  `energy_wh:<stage>`, `images_kept`, `gpu_s_per_kept_image`) make cost
-  vs. selection-surplus visible per product. Set
-  `OBS_RESOURCE_SAMPLING=0` to disable sampling.
-
-Interrupted runs export too: Ctrl-C calls `abort_trace()` so the
-in-flight product's stage span and finished ComfyUI jobs still reach
-Langfuse. See `observability/observability.md` for the full
-architecture, data model, and a module-by-module walkthrough.
+See `Observability.md` for the full architecture, data model, and a
+module-by-module walkthrough.
 
 Written against the Langfuse Python SDK **v5** (`langfuse==5.0.2`), which
 is OpenTelemetry-based: there is no trace object (`TraceHandle` wraps the
@@ -743,14 +789,127 @@ root span), and spans can't be backdated, so each stage opens its span
 before running and closes it after. v5 requires **self-hosted Langfuse
 >= 4.59.0** (or Langfuse Cloud) - v2 and v3 servers are unsupported, which
 is why the compose file is the official six-container stack pinned to the
-`:4` images rather than a minimal Postgres-only one. **Langfuse v4 runs
-in `events_only` mode**: trace data lives in ClickHouse (ingested web →
-MinIO → Redis queue → worker), Postgres holds only accounts/projects and
-keys, and the legacy read endpoints are disabled - query the UI or the
-events-based API rather than `GET /api/public/traces`. Each script prints
-a one-line `Tracing: on/off` status at startup (`startup_check()`),
-because best-effort tracing otherwise fails silently on a wrong key or
-an unreachable server.
+`:4` images rather than a minimal Postgres-only one. Each script prints a
+one-line `Tracing: on/off` status at startup (`startup_check()`), because
+best-effort tracing otherwise fails silently on a wrong key or an
+unreachable server.
+
+#### What is recorded for the local image and video models
+
+Diffusion models have no tokens, so **usage is defined as GPU time plus work
+units**. Every ComfyUI attempt in Agent 4 and Agent 6 (`generate_node`) is one
+`generation` observation under its stage - `comfyui.image_batch`,
+`comfyui.video`, and `comfyui.abandoned_job` (below). It is a generation
+because only generations carry `usage_details`, which a dashboard can sum.
+
+`usage_details` (integers only - the SDK type is `Dict[str, int]`, so
+durations are milliseconds):
+
+| Key | Meaning |
+|---|---|
+| `gpu_ms` | ComfyUI's own execution time (`execution_start` to `execution_success`/`_error`/`_interrupted` in `/history`), not client wall time. 0 when unknown (a timed-out job - see "Abandoned jobs"). |
+| `queue_wait_ms` | `execution_start` minus the job's `create_time`; both are ComfyUI server timestamps, so no client clock is involved. |
+| `wait_ms`, `save_ms`, `wall_ms` | Client-side phases: waiting for completion, downloading + saving, the whole attempt. |
+| `images_requested` / `images_produced` | Image jobs: the latent batch size vs images actually saved. |
+| `videos_requested` / `videos_produced` / `frames` | Video jobs. |
+| `sampler_steps` | Steps of a job that completed. |
+| `energy_mwh` | Board energy over the attempt, integrated from `nvidia-smi` `power.draw` (includes the idle baseline). |
+| `total` | Set to `gpu_ms` explicitly so the server doesn't sum unrelated keys. |
+
+`model` is the checkpoint; `model_parameters` hold steps, cfg, sampler,
+scheduler, width/height, batch size or frames, fps, precision and offload.
+Per-job **metadata** adds:
+
+- **Outcome** - `success`, `timeout`, `comfy_error`, `queue_error`,
+  `no_output`, `upload_error` / `workflow_config_error` (video),
+  `connection_error`, `save_error`, `count_mismatch` (the job succeeded but
+  produced the wrong number of images - counted as waste), `exception`; plus
+  the phase it ended in. Failed attempts are logged at `ERROR` level.
+- **Throughput** (successful jobs) - `sec_per_image`, `images_per_min`,
+  `megapixels_per_s`, `sec_per_step`; video: `sec_per_frame`,
+  `frames_per_min`; and whether ComfyUI reused cached nodes (`warm`), since a
+  cold job includes the checkpoint load.
+- **GPU telemetry** from `nvidia-smi`, sampled every 2 s for the job -
+  utilisation, power (mean/max), SM clock and its ratio to the maximum,
+  temperature, VRAM start/peak/total, which throttle reasons were active and
+  for what fraction of samples, and cumulative throttle time where the driver
+  reports it. `nvidia-smi` is independent of ComfyUI's HTTP server, which
+  cannot answer while it is blocked on a sampling step. Fields a driver
+  rejects or reports as `[N/A]` are simply absent: three field sets (full,
+  core, minimal) are probed once and the first the installed `nvidia-smi`
+  accepts is used. Utilisation only says a kernel was running, so it reads
+  near 100% for any job - good for spotting stalls; power, clocks and
+  throttle state are the better performance indicators on a laptop GPU.
+- **Context that explains slow jobs** - what ComfyUI already had running or
+  queued at start (a stale job from an earlier timeout), how much GPU memory
+  Ollama held, free system RAM, and ComfyUI's version and own VRAM/RAM view.
+  ComfyUI's `torch_vram_*` figures are recorded raw: this install uses
+  `cudaMallocAsync`, where they are unlikely to track real usage.
+- **Video workflow facts** - resolution, fps, precision, offload, and
+  `resize_keep_proportion` (see "Known gaps").
+
+**Scores** (trace-level, only for numbers a dashboard can't derive from the
+observations): `gpu_s:<stage>`, `gpu_wasted_s:<stage>`, `waste_pct:<stage>`,
+`jobs_timed_out:<stage>`, `jobs_failed:<stage>`, `retries:<stage>`,
+`gpu_duty_pct:<stage>` (share of the stage's wall clock ComfyUI was
+executing), `energy_wh:<stage>`, `gpu_throttled_pct:<stage>`,
+`images_requested`, `images_produced`, `videos_requested`, `videos_produced`,
+and after selection `images_kept`, `selection_surplus`,
+`gpu_s_per_kept_image`.
+
+**Waste vs. selection surplus.** `gpu_wasted_s` counts only attempts whose
+output was thrown away - timeouts, errors, count mismatches, and the late real
+cost of abandoned jobs. Candidates Agent 5 doesn't pick are *not* waste: that
+is the by-design cost of choosing, reported separately as
+`selection_surplus`. For video there is no post-generation judge (the review
+gate comes before it), so "kept" means "produced".
+
+**Abandoned jobs.** A timed-out job is cancelled in ComfyUI (see Known gaps for
+the settings), but it ran for some time first, so its GPU cost is unknown at the
+moment it times out. At the start of each later attempt and when
+the stage finishes, the pipeline looks the job up in `/history` and emits a
+`comfyui.abandoned_job` observation carrying the real `gpu_ms`, added to the
+stage's wasted GPU seconds. A job still running at stage end is counted as
+unreconciled. `produced_after_client_gave_up` records how often a timed-out
+job produced its images anyway.
+
+Usage covers the jobs that ran in *this process* - a resumed stage reports
+only the remaining themes. Per-stage totals are held outside LangGraph state,
+so nothing here touches checkpoints.
+
+In Langfuse: chart the usage types (`gpu_ms`, `energy_mwh`, images/videos) by
+observation name or model, take latency percentiles per `comfyui.*`
+observation, chart the scores per trace, and group a batch with Sessions.
+
+#### Testing the instrumentation (`tests/obs/`)
+
+The tests use a fake ComfyUI HTTP server (its `/history` entries are shaped
+like a real ComfyUI 0.28.0 entry captured on the target machine), a fake
+`nvidia-smi`, and stubs for the project modules the tests don't exercise
+(prompt/selection schemas, utils, other agents' graphs, the guardrail check).
+
+```bash
+pytest tests/obs
+```
+
+- `test_differential.py` runs the original and the instrumented
+  `generate_node` (Agent 4 and 6) side by side across failure scenarios and
+  four tracing modes (off, on, Langfuse raising, `nvidia-smi` failing) and
+  requires identical returned values; with tracing off, identical HTTP
+  traffic. It compares against a pristine copy of the pre-instrumentation tree
+  at `orig/` (also used by one part of `test_allowlist.py`).
+- `test_trace_content.py`, `test_units.py`, and `test_pipeline_integration.py`
+  check the recorded numbers, outcome classification, `nvidia-smi` field
+  fallback, the span tree through the real `run_product()`, reconciliation of a
+  job that timed out and finished later, the Ctrl-C path, and a blocked product.
+- `test_allowlist.py` prints how the installed LangGraph serializer treats the
+  state types; its result depends on the installed `langgraph-checkpoint`
+  version, so run it in your own environment.
+
+These tests ran in a Linux sandbox against fakes. What they could not
+establish - real `nvidia-smi` field support on the laptop GPU, ComfyUI's
+history for interrupted jobs, Langfuse v4 dashboard charting of custom usage
+keys, Python 3.14 - is listed in `Observability.md`.
 
 ## Configuration notes
 
@@ -773,10 +932,10 @@ Worth understanding rather than just accepting the defaults:
 | `max_creative_retries` | 2 | Agent 2's retry budget. |
 | `prompt_gen_primary_model` / `prompt_gen_fallback_model` | `openai/gpt-oss-120b` / `openai/gpt-oss-20b` | Agent 3's model chain - kept as its own settings block, separate from Agent 2's, because prompt-writing for generation models is a different skill from ad copywriting. The primary is an inherited placeholder, not yet validated with its own comparison test - see `Prompt_generation.md`. |
 | `prompt_gen_temperature` | 0.6 | Slightly lower than Agent 2's 0.7 - prompt-writing benefits from more precision/consistency than open-ended ad copy, but still needs some variation across 2-3 distinct visual themes. |
-| `max_prompt_gen_retries` | 2 | Agent 3's retry budget - applied per theme, since only the themes that failed are re-called. |
-| `prompt_gen_max_tokens` | 2048 (**unused**) | Not read anywhere: `structured_chat_groq` sends `groq_max_tokens` as `max_tokens` for every Groq caller. Both are 2048 today, so behavior matches, but changing this one has no effect until `structured_chat_groq` accepts a per-call cap. |
+| `max_prompt_gen_retries` | 2 | Agent 3's retry budget. |
 | `comfyui_checkpoint` | `juggernautXL_ragnarok.safetensors` | Agent 4's SDXL-family checkpoint. |
 | `total_images_per_product` / `max_image_gen_retries` | 5 / 2 | Agent 4's total candidate images (split across themes via `distribute_total()`) and retry budget. |
+| `comfyui_generation_timeout_seconds` / `comfyui_image_timeout_base_seconds` / `comfyui_image_timeout_per_image_seconds` | 180.0 / 60.0 / 90.0 | Agent 4's wait timeout is `max(first, base + per_image x batch_size)`: 240s for 2 images, 330s for 3, 510s for 5. Starting values from three observations, deliberately generous - re-derive from recorded `gpu_ms`. A job that exceeds it is cancelled. |
 | `comfyui_video_num_frames` | 41 | Real runtime parameter, not fixed by the checkpoint - see `Video_generation.md` Challenge 3. Must be `4n+1` for CogVideoX's temporal VAE. |
 | `comfyui_video_generation_timeout_seconds` | 4500.0 | Set from real measured per-attempt cost, not a guess - see `Video_generation.md` Challenge 2. |
 | `max_video_gen_retries` | 0 | A cost decision, not a resilience default - a "free" retry costs another ~60 minutes on this hardware. See `Video_generation.md` Challenge 2. |
@@ -790,12 +949,13 @@ Worth understanding rather than just accepting the defaults:
 | File | Responsibility |
 |---|---|
 | `app/core/config.py` | Env-driven settings for all six agents |
-| `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) - every call is recorded as a Langfuse `generation` with model, usage and latency |
+| `app/core/llm.py` | `structured_chat` (Ollama text), `structured_chat_vision` (Ollama + images, used by Agent 5), `structured_chat_groq` (Groq text, used by Agents 2/3) |
 | `app/core/checkpoint.py` | Flat JSON stage checkpoint (Agents 1, 2, 3, 5, plus the guardrail verdict) |
 | `app/core/langgraph_checkpoint.py` | LangGraph-native resume helper (`run_checkpointed`), used by Agents 4 and 6 |
-| `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; never raises past a stage boundary, returns a `ProductRunResult` instead |
+| `app/core/pipeline.py` | `run_product()` - the shared stage runner both bulk-processing entry points call; runs the guardrail gate between Agents 1 and 2; never raises past a stage boundary, returns a `ProductRunResult` instead; opens the Langfuse trace (session + product slug), closes it on Ctrl-C, and holds the checkpoint msgpack allow-list |
 | `app/core/manifest.py` | `ManifestWriter` (per-row-flushed results CSV) + `read_urls()` (accepts a bare URL or a CSV) |
-| `observability/observability.py` | Langfuse tracing - one trace/product, one span/stage, per-LLM-call generations, Tavily tool spans, ComfyUI job usage + resource sampling; no-op if unconfigured |
+| `observability/observability.py` | Langfuse tracing - one trace/product (grouped into a session), one span/stage, LLM/tool observations, per-job ComfyUI usage and GPU telemetry; no-op if unconfigured |
+| `observability/observability.md` | Observability design: architecture, data model, verification status |
 | `app/agents/research_agent/schema.py` | `ProductResearch` output contract + `ScrapedProductData` intermediate shape |
 | `app/agents/research_agent/scraper.py` | Playwright fetch + JSON-LD/OG/text extraction, cost-aware review-scroll escalation |
 | `app/agents/research_agent/prompts.py` | System + user prompt for the extraction call |
@@ -804,21 +964,21 @@ Worth understanding rather than just accepting the defaults:
 | `app/agents/research_agent/graph.py` | Graph assembly |
 | `app/agents/research_agent/guardrails.py` | `check_guardrails()` - page-validity heuristic + Llama Guard 3 classification, called by `pipeline.py` between Agents 1 and 2 (not a graph node) |
 | `app/agents/creative_strategy_agent/schema.py` | `CreativeDirection` output contract + `AudienceAngle`/`VisualTheme` sub-models |
-| `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure); each search is a Langfuse tool span, so failures are recorded rather than invisible |
+| `app/agents/creative_strategy_agent/market_research.py` | `fetch_market_context()` - concurrent Tavily trend + competitor searches, best-effort (never raises, empty string on any failure) |
 | `app/agents/creative_strategy_agent/prompts.py` | System + user prompt for the creative-generation call |
 | `app/agents/creative_strategy_agent/state.py` | LangGraph state TypedDict |
 | `app/agents/creative_strategy_agent/nodes.py` | Node functions, model-fallback chain, retry/validation routing |
 | `app/agents/creative_strategy_agent/graph.py` | Graph assembly |
 | `app/agents/prompt_gen_agent/schema.py` | `PromptGenerationOutput` output contract + `ImageGenerationPrompt`/`VideoGenerationPrompt`/`ThemePromptSet` sub-models |
-| `app/agents/prompt_gen_agent/prompts.py` | System + user prompt for one visual theme per call, including the other themes' settings (for hook variety) and a per-theme retry reason |
-| `app/agents/prompt_gen_agent/state.py` | LangGraph state TypedDict - per-theme results, models, provider errors and validation feedback |
-| `app/agents/prompt_gen_agent/nodes.py` | Node functions - concurrent per-theme calls, targeted retries, model-fallback chain, per-theme validation |
+| `app/agents/prompt_gen_agent/prompts.py` | System + user prompt for the prompt-generation call |
+| `app/agents/prompt_gen_agent/state.py` | LangGraph state TypedDict |
+| `app/agents/prompt_gen_agent/nodes.py` | Node functions, model-fallback chain, retry/validation routing |
 | `app/agents/prompt_gen_agent/graph.py` | Graph assembly |
 | `app/agents/image_generation/schema.py` | `ImageGenerationOutput` output contract + `GeneratedImage`/`ThemeGenerationResult` |
 | `app/agents/image_generation/state.py` | LangGraph state TypedDict |
-| `app/agents/image_generation/nodes.py` | Node functions, ComfyUI calls, retry/validation routing |
+| `app/agents/image_generation/nodes.py` | Node functions, ComfyUI calls, retry/validation routing; each attempt traced as a ComfyUI job |
 | `app/agents/image_generation/graph.py` | Graph assembly - accepts an optional `checkpointer` |
-| `app/agents/image_generation/comfyui_client.py` | Generic ComfyUI HTTP client (queue/poll/fetch), base class for Agent 6's client |
+| `app/agents/image_generation/comfyui_client.py` | Generic ComfyUI HTTP client (queue/poll/fetch), base class for Agent 6's client; also best-effort read-only probes (`queue_snapshot`, `system_stats`, `get_history_entry`) used only for tracing |
 | `app/agents/image_generation/aspect_ratio.py` | `aspect_ratio` string -> pixel dimensions |
 | `app/agents/image_selection_agent/schema.py` | `ImageSelectionOutput` output contract + `ImageCandidateScore`/`ImageCritiqueResponse`/`ThemeSelectionResult` |
 | `app/agents/image_selection_agent/prompts.py` | Critic system prompt (local-checkpoint-calibrated rubric) + user prompt builder |
@@ -827,7 +987,7 @@ Worth understanding rather than just accepting the defaults:
 | `app/agents/image_selection_agent/graph.py` | Graph assembly |
 | `app/agents/video_generation/schema.py` | `VideoGenerationOutput` output contract + `GeneratedVideo`/`ThemeVideoResult` |
 | `app/agents/video_generation/state.py` | LangGraph state TypedDict - consumes Agent 5's `ImageSelectionOutput` |
-| `app/agents/video_generation/nodes.py` | Node functions, ComfyUI calls, retry/validation routing |
+| `app/agents/video_generation/nodes.py` | Node functions, ComfyUI calls, retry/validation routing; each attempt traced as a ComfyUI job, with workflow facts read from the exported JSON |
 | `app/agents/video_generation/graph.py` | Graph assembly - accepts an optional `checkpointer` |
 | `app/agents/video_generation/video_comfyui_client.py` | Subclasses Agent 4's `ComfyUIClient`, overrides `wait_for_completion` |
 | `scripts/test_live.py` | Standalone step-by-step debugging runner for Agent 1 |
@@ -835,8 +995,9 @@ Worth understanding rather than just accepting the defaults:
 | `scripts/test_full_pipeline_live.py` | Chains all six agents for end-to-end testing, with per-stage early-exit flags and checkpointing |
 | `scripts/run_batch.py` | Bulk (or single-URL) entry point - Agents 1-5, always stops before Video Generation, writes the results manifest |
 | `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, enforces the HITL approvals gate on `--from-results` without `--rows` |
-| `observability/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
-| `observability/docker-compose.langfuse.yml` + `observability/langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values (also the tracing bootstrap keys fallback) |
+| `scripts/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
+| `observability/docker-compose.langfuse.yml` + `observability/langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values |
+| `tests/obs/` | Instrumentation tests: fake ComfyUI and `nvidia-smi`, stub overlay, differential / trace-content / unit / integration / allow-list tests |
 | `main.py` | CLI runner for Agent 1, standalone |
 | `Product_research.md` | Agent 1 design narrative - challenges hit, decisions made, why |
 | `Creative_strategy.md` | Agent 2 design narrative - same format |
@@ -890,18 +1051,40 @@ Worth understanding rather than just accepting the defaults:
   chosen via a real 2-3 candidate comparison against sample
   `CreativeDirection` inputs. Worth running before trusting it - see
   `Prompt_generation.md`.
-- **Per-theme Prompt Generation path not yet live-tested** (Agent 3): the
-  concurrent per-theme calls and targeted retries are covered by a mocked
-  routing test, but the rework has not had a real Groq run yet. One 2-3
-  theme product end to end is worth doing before a batch, since the request
-  cost is now N per product - see `Prompt_generation.md` Challenge 3.
 - **Image/video aspect ratio mismatch** (Agents 3 & 6): `ImageGenerationPrompt.
   aspect_ratio` is chosen per-theme for social framing (e.g. `4:5`,
   `9:16`), but the confirmed video target
   (`NimVideo/cogvideox-2b-img2vid`) has a fixed 720x480 landscape output.
   Whichever image Agent 5 selects as a video's source frame still needs
   reconciling with that fixed resolution - resize/letterbox vs. crop - not
-  yet decided.
+  yet decided. Worse than undecided today: the exported workflow's resize
+  node is fixed at 720x480 with `keep_proportion: false`, so a source frame in
+  any other aspect ratio is **stretched** to 3:2 before animation. It is now
+  visible on every video job (`resize_keep_proportion=false`) but not changed.
+- **ComfyUI timeout values are starting guesses** (Agents 4 & 6). The old
+  failure - Agent 4's fixed 180s wait timeout was shorter than a 3-image batch
+  (~190-250s), and a timed-out job kept running so every retry queued behind
+  it - is fixed: the image timeout is now sized to the batch
+  (`comfyui_image_timeout_base_seconds` + `comfyui_image_timeout_per_image_seconds`
+  per image, floored at `comfyui_generation_timeout_seconds`), a timed-out job is
+  cancelled in ComfyUI before the error is raised (a running job is interrupted,
+  a pending one is dequeued, so the job it waited behind is not killed), and
+  failed `/history` polls are retried instead of failing the attempt, as the
+  video client already did. The 60s + 90s/image defaults rest on three
+  observations, so tune them from the recorded `gpu_ms`; and how ComfyUI
+  0.28.0 records an interrupted job in `/history`, and whether its `/interrupt`
+  honours a `prompt_id`, are not yet verified (see `Observability.md`).
+- **Observability limits**: no per-node timing or live step progress inside a
+  ComfyUI job (needs ComfyUI's websocket, which may stall like its HTTP
+  server); no per-process GPU memory from the Windows `GPU Process Memory`
+  counters (would separate Ollama from ComfyUI and show spill into shared
+  memory - needs a probe on the target machine first); no monetary cost
+  tracking (GPU seconds and energy are recorded, nothing is priced); a batch
+  and a later video run are separate sessions and traces per product, joined
+  only by URL / `product` metadata; and the unverified items listed in
+  `Observability.md` (real `nvidia-smi` field support on the laptop GPU,
+  Langfuse v4 charting of custom usage keys, the allow-list on the installed
+  `langgraph-checkpoint`).
 - **Cross-agent regeneration loop** (Agent 5): if every candidate for a
   theme scores below threshold, Agent 5 currently falls back to the
   best-available candidate rather than asking Agent 4 to regenerate. No
