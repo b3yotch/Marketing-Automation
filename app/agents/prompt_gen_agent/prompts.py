@@ -30,16 +30,19 @@ Produce:
 - An image prompt: a dense natural-language description of subject, setting, \
 lighting, composition, and style, plus a negative prompt only if something \
 specific is worth excluding, plus an aspect ratio that fits the composition.
-- A video prompt: the same visual description, written densely and verbosely \
-(this video model was trained on long, detailed captions - do not compress \
-it), plus explicit camera/subject motion in concrete cinematography terms \
-(e.g. "slow dolly-in", "static camera, product rotates on turntable", \
-"handheld pan left to right") - never vague terms like "dynamic" or \
-"exciting". This is an IMAGE-TO-VIDEO model: a specific already-generated \
-image will be the starting frame, so the visual description should describe \
-what that starting frame already shows, not invent a different scene. Do \
-not mention duration, frame rate, or resolution - those are fixed by the \
-video model itself, not something you choose.
+- A video prompt: a compact version of the same visual description, plus \
+explicit camera/subject motion in concrete cinematography terms (e.g. \
+"slow dolly-in", "static camera, product rotates on turntable", "handheld \
+pan left to right") - never vague terms like "dynamic" or "exciting". The \
+CogVideoX text encoder hard-caps at 226 tokens and ComfyUI rejects anything \
+longer, so keep base_prompt under ~105 words and motion_description under \
+~25 words (~130 words / ~800 characters combined - it is roughly 4 \
+characters per token). This is an \
+IMAGE-TO-VIDEO model: a specific already-generated image will be the \
+starting frame, so the visual description should describe what that starting \
+frame already shows, not invent a different scene. Do not mention duration, \
+frame rate, or resolution - those are fixed by the video model itself, not \
+something you choose.
 - A short list of hooks and captions, copied VERBATIM from the ones given, \
 that pair well with this specific visual - never write new ones.
 

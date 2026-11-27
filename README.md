@@ -726,19 +726,32 @@ image (`--from-results <manifest>` with no `--rows`):
 
 ```bash
 python scripts/review.py outputs/batch_results_<ts>.csv
-# approve/reject each product, see its below-threshold theme flags
+# per theme: approve, replace with another candidate, or skip just that theme
 python scripts/generate_videos.py --from-results outputs/batch_results_<ts>.csv \
     --approvals outputs/approvals_<ts>.csv
 ```
 
-For each product, `review.py` loads Agent 5's checkpointed selection,
-prints every theme with the path of its chosen image, and **opens the
-below-threshold themes' images in your default viewer** - the ones Agent 5
-itself wasn't confident about, where a human look is worth the most. `v` at
-the prompt opens all of a product's selected images; `--open-all` opens
-everything automatically and `--no-open` opens nothing (e.g. over SSH).
-Re-running on the same manifest resumes: approved/rejected products keep
-their decision and only unreviewed or skipped ones are asked again.
+`review.py` loads Agent 5's checkpointed selection and asks about each theme
+separately: `y` approves its chosen image, `n` lists every other candidate
+Agent 4 generated for that theme so you can pick one yourself, `s` skips
+just that theme, and `a` approves the rest of the product. Rejecting one
+image therefore no longer costs the other themes their videos - the
+approvals CSV carries the approved set plus any manual image overrides, and
+Agent 6 honours both (`theme_allowlist` / `theme_overrides`).
+
+By default it **opens the below-threshold themes' images in your default
+viewer** - the ones Agent 5 itself wasn't confident about, where a human
+look is worth the most. `v` re-opens the current theme's pick; `--open-all`
+opens every selected image (and every candidate when replacing) and
+`--no-open` opens nothing (e.g. over SSH). Re-running on the same manifest
+resumes per theme: decided themes keep their decision and only undecided
+ones are asked again. Old product-level approvals files are migrated in
+place and still mean "all themes".
+
+Passing `--approvals` also **reopens a video stage that already finished**,
+instead of reporting "already complete" and skipping the new decisions.
+Videos for themes you still approve are kept; rejected themes are dropped
+and replaced images are used for the regeneration.
 
 Typing specific row numbers (`--rows`) or specific URLs (positional args,
 `--csv`) already required a person to choose each one, so those paths
@@ -995,7 +1008,7 @@ Worth understanding rather than just accepting the defaults:
 | `scripts/test_full_pipeline_live.py` | Chains all six agents for end-to-end testing, with per-stage early-exit flags and checkpointing |
 | `scripts/run_batch.py` | Bulk (or single-URL) entry point - Agents 1-5, always stops before Video Generation, writes the results manifest |
 | `scripts/generate_videos.py` | Video generation for a chosen subset of URLs - reuses whatever's already checkpointed, enforces the HITL approvals gate on `--from-results` without `--rows` |
-| `scripts/review.py` | Human-in-the-loop review: approve/reject each `status=ok` product from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
+| `scripts/review.py` | Human-in-the-loop review: approve, replace, or skip each theme's selected image from a batch manifest, writes an approvals CSV, scores the matching Langfuse trace |
 | `observability/docker-compose.langfuse.yml` + `observability/langfuse.env` | Official self-hosted Langfuse v4 stack, plus first-boot project/API-key init values |
 | `tests/obs/` | Instrumentation tests: fake ComfyUI and `nvidia-smi`, stub overlay, differential / trace-content / unit / integration / allow-list tests |
 | `main.py` | CLI runner for Agent 1, standalone |

@@ -18,7 +18,7 @@ Two real differences from Agent 4's shape, not oversights:
    Video_generation.md Challenge 2 discussion - video's cost profile
    doesn't reward batching the way cheap image batches did), so `video` is
    a single optional field, not a list.
-2. `status` distinguishes "skipped_no_source_image" from "success" -
+2. `status` distinguishes the two non-generation outcomes from "success" -
    Agent 4 has no equivalent because it always has *something* to attempt
    (a prompt). This agent can hit a theme with no valid source frame to
    animate (that theme was itself skipped upstream - either Agent 4
@@ -26,9 +26,12 @@ Two real differences from Agent 4's shape, not oversights:
    from after its own deterministic filter - see Image_generation.md
    Challenge 3 and Image_selection.md) - that's not a generation failure
    worth retrying, so it's recorded explicitly rather than silently
-   absent. A genuine retries-exhausted generation failure, by contrast, is
-   NOT recorded here at all - same as Agent 4, the theme is simply absent
-   from theme_results.
+   absent. `skipped_not_approved` is the same shape but for the HITL gate:
+   a human rejected this theme's image in observability/review.py while
+   approving others for the same product, so no video is generated for it.
+   A genuine retries-exhausted generation failure, by contrast, is NOT
+   recorded here at all - same as Agent 4, the theme is simply absent from
+   theme_results.
 """
 
 from __future__ import annotations
@@ -67,11 +70,16 @@ class ThemeVideoResult(BaseModel):
     )
     video: GeneratedVideo | None = Field(
         default=None,
-        description="None only when status is 'skipped_no_source_image'.",
+        description=(
+            "None when status is 'skipped_no_source_image' or "
+            "'skipped_not_approved'."
+        ),
     )
     generation_time_seconds: float = 0.0
     retries_used: int = 0
-    status: Literal["success", "skipped_no_source_image"] = "success"
+    status: Literal[
+        "success", "skipped_no_source_image", "skipped_not_approved"
+    ] = "success"
 
 
 class VideoGenerationOutput(BaseModel):

@@ -15,8 +15,17 @@ just parameterized by which state key finalize_node sets.
 
 from __future__ import annotations
 
+from langgraph.graph import START
 
-async def run_checkpointed(graph, config: dict, fresh_input: dict, output_key: str) -> dict:
+
+async def run_checkpointed(
+    graph,
+    config: dict,
+    fresh_input: dict,
+    output_key: str,
+    *,
+    reopen: dict | None = None,
+) -> dict:
     """
     Runs `graph` (already compiled with a checkpointer) under `config`
     (must carry a thread_id), handling all three states a thread can be in:
@@ -38,10 +47,27 @@ async def run_checkpointed(graph, config: dict, fresh_input: dict, output_key: s
     so the two can only be told apart by whether the stage's own output
     field was ever populated.
 
+    `reopen` overrides every branch below: the given state updates are
+    written to the checkpoint and the graph is restarted from its entry
+    point, carrying the rest of the existing state along. Human review needs
+    this - a finished (or half-finished) video stage must be re-entered when
+    a reviewer rejects or replaces a theme, otherwise the checkpoint short-
+    circuits the new decisions exactly the way it would short-circuit a
+    genuine no-op. `as_node=START` is what makes the restart possible: a
+    finished thread has no pending tasks, and `ainvoke(None)` on it is a
+    no-op, so the checkpoint has to be told the entry point is pending again.
+    Callers only pass `reopen` when the thread already has state, so
+    `fresh_input` (the real prompts/selection) is supplied in the update.
+
     Returns a dict shaped like graph.ainvoke's return either way, so
     callers can do result[output_key] regardless of which branch ran.
     """
     snapshot = await graph.aget_state(config)
+
+    if reopen is not None:
+        print(f"↺ Reopening '{output_key}' to apply new input - keeping results that still apply.")
+        await graph.aupdate_state(config, reopen, as_node=START)
+        return await graph.ainvoke(None, config)
 
     if snapshot.values.get(output_key) is not None:
         print(f"↺ '{output_key}' is already complete for this thread - skipping recomputation.")

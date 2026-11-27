@@ -9,10 +9,6 @@ from app.agents.prompt_gen_agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.agents.prompt_gen_agent.schema import PromptGenerationOutput, ThemePromptSet
 from app.agents.prompt_gen_agent.state import PromptGenState
 
-# ~200 words - rough proxy for the video text encoder's ~226-token ceiling,
-# catching an obviously oversized prompt before it silently truncates.
-MAX_VIDEO_BASE_PROMPT_CHARS = 1200
-
 
 async def _generate_theme(
     creative: CreativeDirection, theme_index: int, previous_error: str | None
@@ -99,10 +95,20 @@ def _theme_problems(theme_set: ThemePromptSet) -> list[str]:
         problems.append("video_prompt.base_prompt is empty")
     if not theme_set.video_prompt.motion_description.strip():
         problems.append("video_prompt.motion_description is empty")
-    if len(theme_set.video_prompt.base_prompt) > MAX_VIDEO_BASE_PROMPT_CHARS:
+    combined_video = (
+        f"{theme_set.video_prompt.base_prompt} "
+        f"{theme_set.video_prompt.motion_description}"
+    ).strip()
+    if len(combined_video) > settings.comfyui_video_max_prompt_chars:
+        # CogVideoX's T5 encoder hard-caps at 226 tokens and the combined
+        # prompt is what gets tokenized - base_prompt alone is the wrong
+        # thing to measure. A 1204-char combined prompt passed the old
+        # base-only 1200-char check and then failed every video attempt.
         problems.append(
-            f"video_prompt.base_prompt is too long "
-            f"({len(theme_set.video_prompt.base_prompt)} chars, likely to truncate)"
+            f"video_prompt is too long for CogVideoX "
+            f"({len(combined_video)} chars combined, limit "
+            f"{settings.comfyui_video_max_prompt_chars}) - shorten "
+            "base_prompt and/or motion_description"
         )
     return problems
 

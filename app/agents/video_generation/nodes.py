@@ -37,7 +37,48 @@ from app.agents.video_generation.schema import GeneratedVideo, ThemeVideoResult,
 from app.agents.video_generation.state import VideoGenerationState
 from observability import observability as obs
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _client = VideoComfyUIClient()
+
+
+def _truncate_words(text: str, limit: int) -> str:
+    """Trim to <= limit chars on a word boundary. Never returns a trailing
+    comma/space, and never raises on a zero/negative limit."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return cut or text[:limit].rstrip(" ,;:-")
+
+
+def _fit_video_prompt(
+    base_prompt: str,
+    motion_description: str,
+    max_chars: int | None = None,
+) -> tuple[str, bool]:
+    """
+    Fit the combined CogVideoX prompt into its text-encoder budget.
+
+    The wrapper hard-caps at 226 T5 tokens and raises "Prompt is too long"
+    instead of truncating, which fails the whole theme after three GPU
+    attempts. The scene description is the verbose part, so keep the motion
+    instruction (it is what makes the shot move) and trim the scene to fit.
+    Returns (prompt, was_clipped).
+    """
+    budget = max_chars or settings.comfyui_video_max_prompt_chars
+    base = " ".join((base_prompt or "").split())
+    motion = " ".join((motion_description or "").split())
+    combined = f"{base} {motion}".strip()
+    if len(combined) <= budget:
+        return combined, False
+
+    # Reserve a slice for the motion (usually short); give the rest to the
+    # scene. A fifth of the budget is enough for the camera move itself.
+    motion_budget = min(len(motion), max(40, budget // 5), max(0, budget))
+    motion = _truncate_words(motion, motion_budget)
+    base = _truncate_words(base, max(0, budget - len(motion) - 1))
+    return f"{base} {motion}".strip(), True
 
 
 def _classify_comfy_error(exc: Exception) -> str:
@@ -94,6 +135,33 @@ def _current_theme(state: VideoGenerationState):
     return prompt_sets[state.get("current_theme_index", 0)]
 
 
+def _next_pending_index(
+    state: VideoGenerationState,
+    start: int,
+    completed: list[ThemeVideoResult] | None = None,
+) -> int:
+    """First theme at or after `start` that has no result yet.
+
+    A run can start with results already seeded (a review decision reopened
+    a previously finished video stage, keeping the still-approved videos),
+    so "next index" is not simply `current + 1`: themes already done must be
+    skipped, even when the done ones are not contiguous.
+    """
+    done = {
+        result.source_setting
+        for result in (
+            completed
+            if completed is not None
+            else state.get("completed_theme_results") or []
+        )
+    }
+    prompt_sets = state["prompts"].prompt_sets
+    index = max(0, start)
+    while index < len(prompt_sets) and prompt_sets[index].source_setting in done:
+        index += 1
+    return index
+
+
 def _find_source_theme(state: VideoGenerationState, source_setting: str) -> ThemeSelectionResult | None:
     """
     Looks up this theme's already-judged selection from Agent 5's output,
@@ -118,6 +186,49 @@ def _find_source_theme(state: VideoGenerationState, source_setting: str) -> Them
     return None  # that theme was skipped entirely upstream of Agent 5 (Agent 4 retries exhausted there)
 
 
+def _is_theme_approved(allowlist: list[str] | None, source_setting: str) -> bool:
+    """True when the reviewer's allowlist admits this theme.
+
+    None means "no per-theme review happened" (a URL passed directly, or a
+    legacy product-level approvals file), so every theme is allowed. A list
+    means review.py wrote a decision for each theme it showed, and only the
+    approved/replaced ones belong in this run.
+    """
+    return allowlist is None or source_setting in allowlist
+
+
+def _resolve_source_image(
+    state: VideoGenerationState,
+    source_setting: str,
+    overrides: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    The image Agent 6 should animate for this theme: the reviewer's manual
+    replacement if there is one, otherwise Agent 5's pick.
+
+    Returns (path, error). The override is checked for existence here
+    because upload_image would otherwise fail as a generic OSError and get
+    reported as "Failed saving video locally", which points at the wrong
+    stage entirely. Review paths are stored the same way the rest of the
+    pipeline stores them (relative to the project root), so both forms are
+    accepted.
+    """
+    override = (overrides or {}).get(source_setting)
+    if override:
+        raw = Path(override)
+        candidates = [raw] if raw.is_absolute() else [_PROJECT_ROOT / raw, raw]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate), None
+        return None, (
+            "The image approved in review no longer exists on disk: "
+            f"{override} (re-run the review step, or generate it again)"
+        )
+
+    source_theme = _find_source_theme(state, source_setting)
+    return (source_theme.selected_local_path if source_theme else None), None
+
+
 def start_node(state: VideoGenerationState) -> dict:
     """
     Runs once: loads the video workflow template (fails loudly here if
@@ -128,9 +239,12 @@ def start_node(state: VideoGenerationState) -> dict:
     don't pile into the same directory).
     """
     template = _client.load_video_workflow_template()
+    # Preserve results seeded by the caller (review reopened a finished
+    # stage) and start at the first theme that still needs work.
+    completed = list(state.get("completed_theme_results") or [])
     return {
-        "current_theme_index": 0,
-        "completed_theme_results": [],
+        "current_theme_index": _next_pending_index(state, 0, completed),
+        "completed_theme_results": completed,
         "retries": 0,
         "error": None,
         "run_id": new_run_id(),
@@ -156,19 +270,43 @@ def _save_video_locally(
     return str(local_path), file_info["filename"]
 
 
-def generate_node(state: VideoGenerationState) -> dict:
+def generate_node(state: VideoGenerationState, config=None) -> dict:
     theme = _current_theme(state)
     theme_index = state.get("current_theme_index", 0)
 
-    source_theme = _find_source_theme(state, theme.source_setting)
+    # Review decisions travel through the graph config, not the checkpointed
+    # state: a resumed thread invokes with ainvoke(None), which would ignore
+    # any fresh input, while config is re-read on every run - so a review
+    # decision takes effect even when the theme loop resumes mid-product.
+    configurable = (config or {}).get("configurable", {})
+    allowlist = configurable.get("theme_allowlist")
+    overrides = configurable.get("theme_overrides") or {}
+
+    if not _is_theme_approved(allowlist, theme.source_setting):
+        # A human rejected this theme's image in review.py while approving
+        # others for the same product. Not a generation failure: skip it
+        # without touching retries, exactly like the no-source case below.
+        result = ThemeVideoResult(
+            source_setting=theme.source_setting,
+            video=None,
+            generation_time_seconds=0.0,
+            retries_used=0,
+            status="skipped_not_approved",
+        )
+        return {"error": None, "_pending_result": result}
+
+    source_image_path, source_error = _resolve_source_image(
+        state, theme.source_setting, overrides
+    )
+    if source_error:
+        return {"error": source_error, "current_seed": None}
+
     # Covers both causes described in the module docstring: source_theme
     # itself is None (Agent 4 skipped this theme, so it never reached
     # Agent 5), or Agent 5 processed the theme but selected_local_path is
     # "" because nothing passed its deterministic filter. Both are falsy,
     # so one check handles both without needing to distinguish them here -
     # neither is retry-worthy from this agent's side either way.
-    source_image_path = source_theme.selected_local_path if source_theme else None
-
     if not source_image_path:
         # No retry-worthy failure here - there's nothing generation could
         # succeed at. Skip immediately, don't touch retries.
@@ -186,7 +324,19 @@ def generate_node(state: VideoGenerationState) -> dict:
     # schema deliberately keeps base_prompt (scene) and motion_description
     # (camera/subject motion) as separate fields for clarity/editability,
     # but they're combined here since there's only one text input to feed.
-    combined_prompt = f"{theme.video_prompt.base_prompt} {theme.video_prompt.motion_description}"
+    # Fit it to the text encoder's budget first: a too-long prompt makes
+    # ComfyUI raise "Prompt is too long" and burns every retry without ever
+    # reaching the sampler (see _fit_video_prompt).
+    raw_prompt = f"{theme.video_prompt.base_prompt} {theme.video_prompt.motion_description}".strip()
+    combined_prompt, prompt_clipped = _fit_video_prompt(
+        theme.video_prompt.base_prompt,
+        theme.video_prompt.motion_description,
+    )
+    if prompt_clipped:
+        print(
+            f"[video] prompt clipped from {len(raw_prompt)} to {len(combined_prompt)} chars "
+            f"to fit CogVideoX's 226-token limit (theme {theme_index})"
+        )
 
     facts = _workflow_facts(state.get("video_workflow_template"))
     frames = settings.comfyui_video_num_frames
@@ -352,7 +502,9 @@ def advance_theme_node(state: VideoGenerationState) -> dict:
 
     return {
         "completed_theme_results": completed,
-        "current_theme_index": state.get("current_theme_index", 0) + 1,
+        "current_theme_index": _next_pending_index(
+            state, state.get("current_theme_index", 0) + 1, completed
+        ),
         "retries": 0,
         "error": None,
         "current_seed": None,

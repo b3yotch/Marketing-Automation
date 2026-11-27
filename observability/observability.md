@@ -452,10 +452,14 @@ between a batch and its review - which could be hours or days.
 
 ### `scripts/review.py`
 
-Walks every `status=ok` row of a batch manifest and asks for a decision.
+Walks every `status=ok` row of a batch manifest and asks for a decision
+**per theme**, not per product.
 
 1. **Loads Agent 5's checkpointed selection** for the URL
-   (`load_stage(url, "selection", ImageSelectionOutput)`).
+   (`load_stage(url, "selection", ImageSelectionOutput)`), and Agent 4's
+   candidates when that stage is available (it is LangGraph-checkpointed,
+   not JSON-checkpointed, so the fallback is the selected image's own
+   `theme_N` folder, which holds every candidate anyway).
 2. **Prints every theme** with its status and the path of the image it
    chose, plus any scalar score/rationale-like fields on the theme record.
    Those extras are found by field-*name pattern* (`score`, `rationale`,
@@ -464,24 +468,30 @@ Walks every `status=ok` row of a batch manifest and asks for a decision.
    `open` on macOS, `xdg-open` elsewhere): by default only the themes
    Agent 5 selected **below its threshold** - the ones it wasn't sure
    about, where a human look is worth most. `--open-all` opens every
-   selected image; `--no-open` opens none; `v` at the prompt opens all of
-   the current product's images on demand.
-4. **Prompts** `y` approve / `n` reject (with an optional reason) / `v`
-   view all / `s` skip for now.
-5. **Writes the decision immediately** to the approvals CSV, then calls
-   `obs.score_trace_by_id(trace_id, "human_approval", 1|0, comment)`.
-6. **Resumes.** Re-running on the same manifest keeps earlier approved/
-   rejected decisions and asks only about unreviewed or skipped products.
-   The approvals file is opened in append mode, and a product that was
-   skipped and later decided has two rows - consumers treat the last row
-   per URL as the decision.
+   selected image (and every candidate when replacing); `--no-open` opens
+   none.
+4. **Prompts per theme** `y` approve / `n` choose another candidate / `s`
+   skip this theme / `a` approve all remaining themes of the product. On
+   `n`, every candidate Agent 4 generated for that theme is listed (and
+   opened unless `--no-open`) so the reviewer picks the frame to animate.
+5. **Writes the decision immediately** to the approvals CSV as
+   `url,theme,decision,note,image_path,...`, where `theme` is the
+   `source_setting` (not a list index - skipped themes make positions
+   drift). Then calls `obs.score_trace_by_id(trace_id, "human_approval",
+   1|0, comment)`, scoring 1 when at least one theme was approved/replaced.
+6. **Resumes per theme.** Re-running on the same manifest keeps earlier
+   decisions and asks only about undecided themes. The approvals file is
+   opened in append mode, and consumers treat the last row per
+   (URL, theme) as the decision. A product-level row (`theme=""`, the old
+   schema) still means "all themes"; old files are migrated in place.
 
-If the selection checkpoint can't be loaded, the script says so loudly
-rather than falling back to a bare prompt: reviewing without seeing
-anything is exactly what the gate exists to prevent.
+If the selection checkpoint can't be loaded, the script says so loudly and
+falls back to a single product-level question rather than pretending it
+showed you the images: reviewing without seeing anything is exactly what
+the gate exists to prevent.
 
-`--auto-approve-clean` skips the prompt for products with no flagged
-themes. It weakens the gate, so it is opt-in.
+`--auto-approve-clean` skips the prompt for themes Agent 5 did not flag.
+It weakens the gate, so it is opt-in.
 
 ### `scripts/generate_videos.py`
 
@@ -490,7 +500,16 @@ themes. It weakens the gate, so it is opt-in.
 | Positional URLs, or `--csv` | None - typing each URL is itself the human decision |
 | `--from-results <manifest> --rows 3,7` | None - hand-picking rows is the human decision |
 | `--from-results <manifest>` (no `--rows`) | **Refuses** unless `--approvals <file>` or `--force` is also given |
-| Any of the above plus `--approvals <file>` | Rows not marked `approved` are dropped and listed as skipped |
+| Any of the above plus `--approvals <file>` | A product with no approved theme is dropped; rejected themes are skipped and replaced images are used, while the rest of that product still runs |
+
+An approvals file also **reopens an already-finished `videos` stage** rather
+than letting `run_checkpointed` short-circuit it as "already complete" -
+otherwise a new review decision could never take effect. Results for themes
+that are still approved are carried over; rejected themes are dropped from
+the output and regenerated themes use the reviewer's image. (The reopening
+itself is `run_checkpointed(..., reopen=...)`: it rewrites the checkpoint
+with `as_node=START` and invokes with `None`, because a finished thread has
+no pending tasks and `ainvoke(None)` alone is a no-op.)
 
 The gate targets exactly one path: "animate everything that worked", the
 one that could spend every GPU-hour in a batch on Agent 5's unaudited

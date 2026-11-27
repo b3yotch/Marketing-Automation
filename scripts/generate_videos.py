@@ -49,13 +49,16 @@ you also pass either:
     --force                                  (explicit, deliberate bypass)
 
 `scripts/review.py` is what produces an approvals file: it walks every
-`status=ok` row in a results manifest, shows you the selection-threshold
-flags Agent 5 raised, and asks approve/reject per product. When
-`--approvals` is given, rows marked anything other than "approved" are
-dropped from the run (and printed as skipped) even if they'd otherwise
-have been included - this applies on top of `--rows` too, if you pass
-both, so an approvals file can also work as a safety net on a hand-picked
-list.
+`status=ok` row in a results manifest, shows the image Agent 5 picked for
+each theme, and records a decision per theme - approve it, replace it with
+another candidate Agent 4 generated for that theme, or skip that theme.
+When `--approvals` is given, a product is dropped only if none of its themes
+were approved/replaced (and the reason is printed); approved products run
+with a theme allowlist and any manual image overrides, so rejecting one
+image no longer costs the other themes their videos. This applies on top of
+`--rows` too, if you pass both, so an approvals file can also work as a
+safety net on a hand-picked list. Old product-level approvals files (one
+`url,decision` row per product) still work and mean "all themes".
 """
 
 from __future__ import annotations
@@ -141,25 +144,79 @@ def _select_from_manifest(path: Path, rows_spec: str | None) -> list[str]:
     return out
 
 
-def _load_approvals(path: Path) -> dict[str, str]:
-    """url -> decision ('approved' | 'rejected' | whatever scripts/review.py wrote),
-    last entry wins if a URL appears more than once in the file."""
-    decisions: dict[str, str] = {}
+def _load_approvals(path: Path) -> tuple[dict[str, str], dict[str, dict[str, dict]]]:
+    """Read an approvals CSV written by review.py.
+
+    Returns (product_level, per_theme):
+      product_level: url -> decision, from rows with an empty `theme` column
+        (old files, and the fallback when Agent 5's selection is missing).
+        Such a decision covers every theme of that product.
+      per_theme: url -> {source_setting: {"decision", "image_path"}}, from
+        the current per-theme rows. Last entry wins, same as before.
+
+    Files written before per-theme review have no `theme` column at all;
+    DictReader returns None for it, which the `or ""` normalizes.
+    """
+    product_level: dict[str, str] = {}
+    per_theme: dict[str, dict[str, dict]] = {}
     for row in read_manifest_rows(path):
         url = (row.get("url") or "").strip()
+        if not url:
+            continue
         decision = (row.get("decision") or "").strip().lower()
-        if url:
-            decisions[url] = decision
-    return decisions
+        theme = (row.get("theme") or "").strip()
+        if theme:
+            per_theme.setdefault(url, {})[theme] = {
+                "decision": decision,
+                "image_path": (row.get("image_path") or "").strip(),
+            }
+        else:
+            product_level[url] = decision
+    return product_level, per_theme
 
 
-def _apply_approvals(urls: list[str], approvals_path: Path) -> list[str]:
-    decisions = _load_approvals(approvals_path)
-    approved, skipped = [], []
+def _apply_approvals(
+    urls: list[str], approvals_path: Path
+) -> tuple[list[str], dict[str, dict]]:
+    """Filter URLs by the approvals file and build per-URL review constraints.
+
+    Returns (kept_urls, review_by_url) where review_by_url[url] holds
+    `theme_allowlist` (only these source_settings run) and `theme_overrides`
+    (setting -> reviewer-chosen image path). A product-level "approved" row
+    yields no constraints, so every theme runs exactly as it would without
+    review - that keeps old approvals files working unchanged.
+    """
+    product_level, per_theme = _load_approvals(approvals_path)
+    kept: list[str] = []
+    review_by_url: dict[str, dict] = {}
+    skipped: list[tuple[str, str]] = []
+
     for url in urls:
-        decision = decisions.get(url)
+        themes = per_theme.get(url) or {}
+        if themes:
+            accepted = {
+                setting: entry
+                for setting, entry in themes.items()
+                if entry["decision"] in ("approved", "replaced")
+            }
+            if not accepted:
+                decisions = ", ".join(sorted({e["decision"] or "not reviewed" for e in themes.values()}))
+                skipped.append((url, f"no theme approved ({decisions})"))
+                continue
+            review_by_url[url] = {
+                "theme_allowlist": list(accepted),
+                "theme_overrides": {
+                    setting: entry["image_path"]
+                    for setting, entry in accepted.items()
+                    if entry["decision"] == "replaced" and entry["image_path"]
+                },
+            }
+            kept.append(url)
+            continue
+
+        decision = product_level.get(url)
         if decision == "approved":
-            approved.append(url)
+            kept.append(url)  # no constraints - all themes
         else:
             skipped.append((url, decision or "not reviewed"))
 
@@ -168,7 +225,7 @@ def _apply_approvals(urls: list[str], approvals_path: Path) -> list[str]:
         for url, reason in skipped:
             print(f"  [{reason}] {url}")
 
-    return approved
+    return kept, review_by_url
 
 
 def _print_summary(results: list[ProductRunResult], total: int, elapsed: float, out_path: Path) -> None:
@@ -225,7 +282,7 @@ async def main() -> None:
     parser.add_argument(
         "--approvals",
         default=None,
-        help="An approvals CSV from scripts/review.py - rows not marked 'approved' are dropped from the run",
+        help="An approvals CSV from scripts/review.py - products with no approved theme are dropped",
     )
     parser.add_argument(
         "--force",
@@ -271,8 +328,9 @@ async def main() -> None:
     if not urls:
         parser.error("No URLs given - pass them positionally, or use --csv / --from-results")
 
+    review_by_url: dict[str, dict] = {}
     if args.approvals:
-        urls = _apply_approvals(urls, Path(args.approvals))
+        urls, review_by_url = _apply_approvals(urls, Path(args.approvals))
         if not urls:
             print("\nNo products remain after the approvals gate. Nothing to do.")
             return
@@ -313,6 +371,8 @@ async def main() -> None:
                         prefix=prefix,
                         run_label="video",
                         session_id=out_path.stem,
+                        theme_allowlist=review_by_url.get(url, {}).get("theme_allowlist"),
+                        theme_overrides=review_by_url.get(url, {}).get("theme_overrides"),
                     )
 
                     results.append(result)

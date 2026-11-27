@@ -236,6 +236,53 @@ def _try_load(url: str, stage: str, schema, resume: bool):
     return loaded
 
 
+def _video_reopen_state(
+    snapshot_values: dict,
+    prompts: PromptGenerationOutput,
+    selection: ImageSelectionOutput,
+    theme_allowlist: list[str] | None,
+    theme_overrides: dict[str, str] | None = None,
+) -> dict:
+    """State update that restarts a video thread for a new review decision.
+
+    Keeps only videos whose theme is still approved - a theme the reviewer
+    rejected must disappear from the output, not survive in the checkpoint -
+    and clears the stage's own output field so `run_checkpointed` re-enters
+    the graph. A theme with a manual image override is also excluded: its
+    existing video animated the old image and must be regenerated.
+    `current_theme_index: 0` plus `start_node`'s pending-index scan means the
+    kept themes are skipped rather than re-rendered.
+    """
+    overrides = theme_overrides or {}
+    existing = snapshot_values.get("videos")
+    previous = (
+        list(existing.theme_results)
+        if existing is not None
+        else list(snapshot_values.get("completed_theme_results") or [])
+    )
+    kept = [
+        theme
+        for theme in previous
+        if theme.video is not None
+        and theme.source_setting not in overrides
+        and (theme_allowlist is None or theme.source_setting in theme_allowlist)
+    ]
+    return {
+        # Fresh inputs too: prompts are JSON-checkpointed and may predate a
+        # prompt-format fix, so the reopened run must use what this
+        # invocation loaded.
+        "prompts": prompts,
+        "selection": selection,
+        "videos": None,
+        "completed_theme_results": kept,
+        "current_theme_index": 0,
+        "retries": 0,
+        "error": None,
+        "current_seed": None,
+        "_pending_result": None,
+    }
+
+
 async def run_product(
     url: str,
     *,
@@ -246,6 +293,8 @@ async def run_product(
     prefix: str = "",
     run_label: str = "batch",
     session_id: str | None = None,
+    theme_allowlist: list[str] | None = None,
+    theme_overrides: dict[str, str] | None = None,
 ) -> ProductRunResult:
     """
     Runs stages 1..`stop_after` for one URL and returns what happened.
@@ -257,6 +306,12 @@ async def run_product(
     in Langfuse's UI/filters - it has no effect when tracing isn't
     configured. `session_id` groups the traces of one command invocation
     into a Langfuse session (the scripts pass the manifest's file stem).
+    `theme_allowlist` / `theme_overrides` carry observability/review.py's
+    per-theme decisions into Agent 6 through the graph config: a setting
+    absent from the allowlist is skipped (its image was rejected), and an
+    override replaces Agent 5's pick with the image the reviewer chose.
+    Both are keyed by source_setting; None/{} means "no review, use Agent 5
+    for every theme".
     """
     if stop_after not in STAGE_ORDER:
         raise ValueError(f"stop_after must be one of {STAGE_ORDER}, got {stop_after!r}")
@@ -552,16 +607,49 @@ async def run_product(
 
             # ---- Stage 6: Video Generation ----------------------------------
             video_graph = build_video_generation_graph(checkpointer=lg_checkpointer)
-            video_config = {"configurable": {"thread_id": f"videos:{slugify_url(url)}"}}
+            # Review decisions go in the config, not the state: config is
+            # applied on every invoke, including the ainvoke(None) a resumed
+            # thread uses, so a per-theme decision still takes effect when
+            # the theme loop continues mid-product.
+            video_config = {
+                "configurable": {
+                    "thread_id": f"videos:{slugify_url(url)}",
+                    "theme_allowlist": theme_allowlist,
+                    "theme_overrides": theme_overrides or {},
+                }
+            }
 
             obs.begin_stage(trace, "videos")
             t = time.perf_counter()
+
+            reopen = None
+            if theme_allowlist is not None or theme_overrides:
+                # A finished video stage would otherwise short-circuit before
+                # the reviewer's decisions (or a fixed prompt budget) ever
+                # reach Agent 6. Restart it from the entry point, keeping
+                # videos for themes that are still approved; rejected themes
+                # are dropped and everything else is regenerated.
+                snapshot = await video_graph.aget_state(video_config)
+                if snapshot.values:
+                    reopen = _video_reopen_state(
+                        snapshot.values,
+                        prompts,
+                        selection,
+                        theme_allowlist,
+                        theme_overrides,
+                    )
+
             try:
                 v = await run_checkpointed(
                     video_graph,
                     video_config,
-                    {"prompts": prompts, "selection": selection, "retries": 0},
+                    {
+                        "prompts": prompts,
+                        "selection": selection,
+                        "retries": 0,
+                    },
                     "videos",
+                    reopen=reopen,
                 )
             except Exception as exc:
                 return _fail(result, "videos", exc, t_start, trace)

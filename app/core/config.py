@@ -112,6 +112,16 @@ class Settings(BaseSettings):
         "low quality, blurry, watermark, bad anatomy, distorted, "
         "flickering, artifacts"
     )
+    # CogVideoX's T5 text encoder hard-caps at 226 tokens, and
+    # ComfyUI-CogVideoXWrapper raises "Prompt is too long" rather than
+    # truncating. Measured with that exact tokenizer on real outputs:
+    # 911 chars = 223 tokens (succeeded), 996 = 237 (failed), 1204 = 286
+    # (failed). That is ~4.1 chars/token, so 226 tokens is ~925 chars; 800
+    # keeps ~15% headroom for denser vocabulary (product names, unicode
+    # hyphens tokenize worse). Prompt Generation targets this budget; the
+    # video node clips to it as a last resort for prompts cached before it
+    # existed (see _fit_video_prompt in video_generation/nodes.py).
+    comfyui_video_max_prompt_chars: int = 800
     # UPDATED after a real measurement, not the earlier guess: one
     # sampling step took ~186s on this RTX 3050 at 49 frames/20 steps/
     # 720x480, i.e. ~3700s (~62min) for a full generation. 1800s

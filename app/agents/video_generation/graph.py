@@ -59,6 +59,16 @@ def _after_advance(state: VideoGenerationState) -> str:
     return "finalize"
 
 
+def _after_start(state: VideoGenerationState) -> str:
+    # A reopened thread can arrive with every theme already done (review kept
+    # all existing videos). start_node then parks the index at the end, so
+    # going straight to generate would index past prompt_sets.
+    prompt_sets = state["prompts"].prompt_sets
+    if state.get("current_theme_index", 0) >= len(prompt_sets):
+        return "finalize"
+    return "generate"
+
+
 def build_graph(checkpointer=None):
     graph = StateGraph(VideoGenerationState)
 
@@ -70,7 +80,11 @@ def build_graph(checkpointer=None):
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("start")
-    graph.add_edge("start", "generate")
+    graph.add_conditional_edges(
+        "start",
+        _after_start,
+        {"generate": "generate", "finalize": "finalize"},
+    )
     graph.add_edge("generate", "validate")
 
     graph.add_conditional_edges(

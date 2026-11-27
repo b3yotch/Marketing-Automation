@@ -41,6 +41,11 @@ class VideoGenerationState(TypedDict, total=False):
     prompts: PromptGenerationOutput
     selection: ImageSelectionOutput
 
+    # NOTE: human review decisions are NOT state fields. They ride in the
+    # graph config (`configurable.theme_allowlist` / `theme_overrides`)
+    # because a resumed thread invokes with ainvoke(None) and would ignore
+    # any fresh state input. See generate_node.
+
     # Progress through prompt_sets (driven by prompts.prompt_sets, same as
     # Agent 4 drives off its own prompt_sets length)
     current_theme_index: int

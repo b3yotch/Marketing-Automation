@@ -73,19 +73,20 @@ class VideoGenerationPrompt(BaseModel):
 
     base_prompt: str = Field(
         description=(
-            "Dense, verbose scene description in English - the video model "
-            "this feeds (CogVideoX-family) was trained on long, detailed "
-            "captions, so don't compress this the way you might for a "
-            "shorter-context model. Keep it under roughly 200 words - the "
-            "text encoder has a practical ceiling (~226 tokens) and anything "
-            "past it risks silent truncation."
+            "Dense but compact scene description in English. The CogVideoX "
+            "text encoder hard-caps at 226 tokens and ComfyUI raises "
+            "'Prompt is too long' rather than truncating; motion_description "
+            "is appended to this field, so keep the combined prompt under "
+            "~130 words (~800 characters) - roughly 105 words here. A longer "
+            "prompt fails the whole video job."
         )
     )
     motion_description: str = Field(
         description=(
             "Camera and subject motion, in concrete cinematography language "
             "(e.g. 'slow dolly-in, subject remains still, background softly "
-            "drifts') - not vague terms like 'dynamic movement'."
+            "drifts') - not vague terms like 'dynamic movement'. Keep it under "
+            "~25 words: it shares the same 226-token budget as base_prompt."
         )
     )
     negative_prompt: str = Field(default="")
